@@ -6,7 +6,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BREW_BIN="${BREW_BIN:-/opt/homebrew/bin/brew}"
-NPM_BIN="${NPM_BIN:-/opt/homebrew/bin/npm}"
+NPM_BIN="${NPM_BIN:-$(command -v npm || true)}"
 
 if [[ ! -x "$BREW_BIN" ]]; then
     printf 'ERROR: Homebrew is required at %s\n' "$BREW_BIN" >&2
@@ -21,9 +21,9 @@ if ! "$BREW_BIN" list --versions poetry >/dev/null 2>&1; then
     "$BREW_BIN" install poetry
 fi
 
-if [[ ! -x /opt/homebrew/bin/claude ]]; then
-    if [[ ! -x "$NPM_BIN" ]]; then
-        printf 'ERROR: npm is required at %s\n' "$NPM_BIN" >&2
+if ! command -v claude >/dev/null 2>&1; then
+    if [[ -z "$NPM_BIN" || ! -x "$NPM_BIN" ]]; then
+        printf 'ERROR: npm is required on PATH or via NPM_BIN.\n' >&2
         exit 1
     fi
     "$NPM_BIN" install --global @anthropic-ai/claude-code
