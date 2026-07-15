@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format clean help run
+.PHONY: install dev test lint format clean help run run-infisical test-infisical-launcher
 
 # Default target
 help:
@@ -10,6 +10,8 @@ help:
 	@echo "  format     - Format code"
 	@echo "  clean      - Clean up generated files"
 	@echo "  run        - Run the bot"
+	@echo "  run-infisical - Run Bot 2 with LifeOS Infisical injection"
+	@echo "  test-infisical-launcher - Test the Infisical credential boundary"
 
 install:
 	poetry install --no-dev
@@ -39,6 +41,12 @@ clean:
 
 run:
 	poetry run claude-telegram-bot
+
+run-infisical:
+	./run-infisical.sh
+
+test-infisical-launcher:
+	bash tests/test_run_infisical_launcher.sh
 
 # For debugging
 run-debug:
