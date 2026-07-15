@@ -18,6 +18,23 @@ Perfect for code reviews on mobile, quick fixes while traveling, or getting AI a
 
 ## 🚀 Quick Start
 
+### LifeOS Bot 2 (Infisical-managed)
+
+Bot 2 is launched through `run-infisical.sh`. The launcher authenticates with
+the local LifeOS machine identity, injects the canonical Infisical secrets, and
+maps them to the environment variables expected by this application. It does
+not require a repository `.env` file.
+
+```bash
+make test-infisical-launcher
+make run-infisical
+```
+
+The machine identity must be stored in
+`~/.config/lifeos/infisical-machine.env` with mode `600`. Runtime overrides use
+the `BOT2_` prefix; for example, `BOT2_APPROVED_DIRECTORY` and
+`BOT2_DATABASE_URL`.
+
 ### Demo
 ```
 You: cd my-project
