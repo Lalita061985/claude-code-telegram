@@ -15,7 +15,7 @@
         <key>HOME</key>
         <string>/Users/LPS</string>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/LPS/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>BOT2_APPROVED_DIRECTORY</key>
         <string>/Users/LPS/META_Projects</string>
     </dict>

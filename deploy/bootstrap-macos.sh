@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BREW_BIN="${BREW_BIN:-/opt/homebrew/bin/brew}"
 NPM_BIN="${NPM_BIN:-$(command -v npm || true)}"
+CLAUDE_INSTALL_PREFIX="${CLAUDE_INSTALL_PREFIX:-$HOME/.local}"
 
 if [[ ! -x "$BREW_BIN" ]]; then
     printf 'ERROR: Homebrew is required at %s\n' "$BREW_BIN" >&2
@@ -26,7 +27,7 @@ if ! command -v claude >/dev/null 2>&1; then
         printf 'ERROR: npm is required on PATH or via NPM_BIN.\n' >&2
         exit 1
     fi
-    "$NPM_BIN" install --global @anthropic-ai/claude-code
+    "$NPM_BIN" install --global --prefix "$CLAUDE_INSTALL_PREFIX" @anthropic-ai/claude-code
 fi
 
 cd "$ROOT_DIR"
