@@ -55,7 +55,7 @@ BOT2_APPROVED_DIRECTORY="$TMP_DIR" \
 bash "$ROOT_DIR/run-infisical.sh" bash -c '
     [[ "$TELEGRAM_BOT_TOKEN" == "fake-bot2-token" ]]
     [[ "$TELEGRAM_BOT_USERNAME" == "Claude_619IIBot" ]]
-    [[ "$ALLOWED_USERS" == "123456789" ]]
+    [[ "$ALLOWED_USERS" == "[123456789]" ]]
     [[ "$APPROVED_DIRECTORY" == "'"$TMP_DIR"'" ]]
     [[ "$DATABASE_URL" == "sqlite:///data/bot.db" ]]
     [[ "$USE_SDK" == "true" ]]

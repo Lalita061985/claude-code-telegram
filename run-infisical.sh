@@ -72,7 +72,7 @@ exec "$INFISICAL_BIN" run \
 
         export TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT2_TOKEN"
         export TELEGRAM_BOT_USERNAME="${TELEGRAM_BOT2_NAME#@}"
-        export ALLOWED_USERS="$TELEGRAM_USER_ID"
+        export ALLOWED_USERS="[$TELEGRAM_USER_ID]"
         export APPROVED_DIRECTORY="${BOT2_APPROVED_DIRECTORY:-${APPROVED_DIRECTORY:-/Users/LPS/META_Projects}}"
         export DATABASE_URL="${BOT2_DATABASE_URL:-${DATABASE_URL:-sqlite:///data/bot.db}}"
         export USE_SDK="${BOT2_USE_SDK:-true}"
