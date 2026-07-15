@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lifeos.claude-code-telegram</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/LPS/services/claude-code-telegram/run-infisical.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/LPS/services/claude-code-telegram</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/LPS</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>BOT2_APPROVED_DIRECTORY</key>
+        <string>/Users/LPS/META_Projects</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/LPS/Library/Logs/claude-code-telegram/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/LPS/Library/Logs/claude-code-telegram/stderr.log</string>
+</dict>
+</plist>

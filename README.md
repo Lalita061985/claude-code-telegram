@@ -35,6 +35,12 @@ The machine identity must be stored in
 the `BOT2_` prefix; for example, `BOT2_APPROVED_DIRECTORY` and
 `BOT2_DATABASE_URL`.
 
+On the LifeOS Mac Mini, the canonical checkout is
+`/Users/LPS/services/claude-code-telegram`. Prepare its isolated Python runtime
+with `deploy/bootstrap-macos.sh`, validate the deployment assets with
+`make test-macos-deploy-assets`, and install the supplied LaunchAgent only
+after an Infisical-backed smoke test succeeds.
+
 ### Demo
 ```
 You: cd my-project
