@@ -20,5 +20,6 @@ fi
 
 grep -Fq '/Users/LPS/services/claude-code-telegram/run-infisical.sh' "$PLIST"
 grep -Fq '/Users/LPS/Library/Logs/claude-code-telegram' "$PLIST"
+grep -Fq '/Users/LPS/.local/bin' "$PLIST"
 
 printf 'PASS: Mac Mini deployment assets are valid and secret-free.\n'
