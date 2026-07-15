@@ -1,4 +1,4 @@
-.PHONY: install dev test lint format clean help run run-infisical test-infisical-launcher
+.PHONY: install dev test lint format clean help run run-infisical test-infisical-launcher test-macos-deploy-assets
 
 # Default target
 help:
@@ -12,6 +12,7 @@ help:
 	@echo "  run        - Run the bot"
 	@echo "  run-infisical - Run Bot 2 with LifeOS Infisical injection"
 	@echo "  test-infisical-launcher - Test the Infisical credential boundary"
+	@echo "  test-macos-deploy-assets - Validate the secret-free Mac Mini service assets"
 
 install:
 	poetry install --no-dev
@@ -47,6 +48,9 @@ run-infisical:
 
 test-infisical-launcher:
 	bash tests/test_run_infisical_launcher.sh
+
+test-macos-deploy-assets:
+	bash tests/test_macos_deploy_assets.sh
 
 # For debugging
 run-debug:
