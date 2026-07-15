@@ -47,6 +47,12 @@ def setup_logging(debug: bool = False) -> None:
         stream=sys.stdout,
     )
 
+    # HTTPX request logs include the Telegram bot token in Bot API URLs.
+    # Suppress them even in application debug mode; response details belong in
+    # structured, token-free application events instead.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     # Configure structlog
     structlog.configure(
         processors=[

@@ -76,6 +76,7 @@ exec "$INFISICAL_BIN" run \
         export APPROVED_DIRECTORY="${BOT2_APPROVED_DIRECTORY:-${APPROVED_DIRECTORY:-/Users/LPS/META_Projects}}"
         export DATABASE_URL="${BOT2_DATABASE_URL:-${DATABASE_URL:-sqlite:///data/bot.db}}"
         export USE_SDK="${BOT2_USE_SDK:-true}"
+        export ENVIRONMENT="${BOT2_ENVIRONMENT:-production}"
         export DEVELOPMENT_MODE="${BOT2_DEVELOPMENT_MODE:-false}"
         export DEBUG="${BOT2_DEBUG:-false}"
 
