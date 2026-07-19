@@ -56,6 +56,37 @@ class FeatureFlags:
         """Check if development features are enabled."""
         return self.settings.development_mode
 
+    @property
+    def api_server_enabled(self) -> bool:
+        """Check if the webhook API server is enabled."""
+        return self.settings.enable_api_server
+
+    @property
+    def scheduler_enabled(self) -> bool:
+        """Check if the job scheduler is enabled."""
+        return self.settings.enable_scheduler
+
+    @property
+    def agentic_mode_enabled(self) -> bool:
+        """Check if agentic conversational mode is enabled."""
+        return self.settings.agentic_mode
+
+    @property
+    def voice_messages_enabled(self) -> bool:
+        """Check if voice message transcription is enabled."""
+        if not self.settings.enable_voice_messages:
+            return False
+        if self.settings.voice_provider == "local":
+            return True  # No API key needed for local whisper.cpp
+        if self.settings.voice_provider == "openai":
+            return self.settings.openai_api_key is not None
+        return self.settings.mistral_api_key is not None
+
+    @property
+    def stream_drafts_enabled(self) -> bool:
+        """Check if streaming drafts via sendMessageDraft is enabled."""
+        return self.settings.enable_stream_drafts
+
     def is_feature_enabled(self, feature_name: str) -> bool:
         """Generic feature check by name."""
         feature_map = {
@@ -67,6 +98,11 @@ class FeatureFlags:
             "token_auth": self.token_auth_enabled,
             "webhook": self.webhook_enabled,
             "development": self.development_features_enabled,
+            "api_server": self.api_server_enabled,
+            "scheduler": self.scheduler_enabled,
+            "agentic_mode": self.agentic_mode_enabled,
+            "voice_messages": self.voice_messages_enabled,
+            "stream_drafts": self.stream_drafts_enabled,
         }
         return feature_map.get(feature_name, False)
 
@@ -89,4 +125,12 @@ class FeatureFlags:
             features.append("webhook")
         if self.development_features_enabled:
             features.append("development")
+        if self.api_server_enabled:
+            features.append("api_server")
+        if self.scheduler_enabled:
+            features.append("scheduler")
+        if self.voice_messages_enabled:
+            features.append("voice_messages")
+        if self.stream_drafts_enabled:
+            features.append("stream_drafts")
         return features

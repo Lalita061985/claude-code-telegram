@@ -10,6 +10,7 @@ from src.bot.utils.formatting import (
     ProgressIndicator,
     ResponseFormatter,
 )
+from src.bot.utils.html_format import escape_html, markdown_to_telegram_html
 from src.config.settings import Settings
 
 
@@ -34,7 +35,7 @@ class TestFormattedMessage:
         """Test FormattedMessage creation."""
         msg = FormattedMessage("Test message")
         assert msg.text == "Test message"
-        assert msg.parse_mode == "Markdown"
+        assert msg.parse_mode == "HTML"
         assert msg.reply_markup is None
 
     def test_formatted_message_length(self):
@@ -51,7 +52,7 @@ class TestResponseFormatter:
         formatter = ResponseFormatter(mock_settings)
         assert formatter.settings == mock_settings
         assert formatter.max_message_length == 4000
-        assert formatter.max_code_block_length == 3000
+        assert formatter.max_code_block_length == 15000
 
     def test_format_simple_message(self, formatter):
         """Test formatting simple message."""
@@ -60,7 +61,7 @@ class TestResponseFormatter:
 
         assert len(messages) == 1
         assert messages[0].text == text
-        assert messages[0].parse_mode == "Markdown"
+        assert messages[0].parse_mode == "HTML"
 
     def test_format_code_blocks(self, formatter):
         """Test code block formatting."""
@@ -68,8 +69,12 @@ class TestResponseFormatter:
         messages = formatter.format_claude_response(text)
 
         assert len(messages) == 1
-        assert "```" in messages[0].text
-        assert "# python" in messages[0].text
+        assert "<pre>" in messages[0].text
+        assert "<code" in messages[0].text
+        assert (
+            "print(&#x27;hello&#x27;)" in messages[0].text
+            or "print('hello')" in messages[0].text
+        )
 
     def test_split_long_message(self, formatter):
         """Test splitting long messages."""
@@ -91,6 +96,7 @@ class TestResponseFormatter:
         assert "❌" in error_msg.text
         assert "Error" in error_msg.text
         assert "Something went wrong" in error_msg.text
+        assert error_msg.parse_mode == "HTML"
 
     def test_format_success_message(self, formatter):
         """Test success message formatting."""
@@ -108,7 +114,8 @@ class TestResponseFormatter:
         assert len(messages) >= 1
         assert "📄" in messages[0].text
         assert "Test Output" in messages[0].text
-        assert "```" in messages[0].text
+        assert "<pre>" in messages[0].text
+        assert "<code" in messages[0].text
 
     def test_format_empty_code_output(self, formatter):
         """Test formatting empty code output."""
@@ -161,32 +168,43 @@ class TestResponseFormatter:
         # Should reduce multiple newlines
         assert "\n\n\n" not in cleaned
 
-    def test_markdown_escaping(self, formatter):
-        """Test markdown character escaping outside code blocks."""
-        text_with_markdown = "This has *bold* and _italic_ text"
-        result = formatter._escape_markdown_outside_code(text_with_markdown)
-
-        # Should escape special characters outside code
-        assert r"\*" in result or r"\_" in result
+    def test_clean_text_converts_markdown_to_html(self, formatter):
+        """Test that _clean_text converts markdown bold to HTML."""
+        text = "This is **bold** text"
+        cleaned = formatter._clean_text(text)
+        assert "<b>bold</b>" in cleaned
 
     def test_code_block_preservation(self, formatter):
         """Test that code blocks preserve special characters."""
-        text_with_code = "Normal text\n```\ncode_with_underscores\n```"
-        result = formatter._escape_markdown_outside_code(text_with_code)
+        text = "Normal text\n```\ncode_with_underscores\n```"
+        cleaned = formatter._clean_text(text)
 
-        # Code block content should not be escaped
-        assert "code_with_underscores" in result
+        # Code block content should be inside <pre><code> tags
+        assert "<pre><code>" in cleaned
+        assert "code_with_underscores" in cleaned
 
     def test_truncate_long_code_block(self, formatter):
-        """Test truncation of very long code blocks."""
-        long_code = "x" * 4000
+        """Test truncation of very long code blocks via _format_code_blocks."""
+        long_code = "x" * 20000
+        # Test _format_code_blocks directly with pre-converted HTML
+        html_block = f'<pre><code class="language-python">{long_code}</code></pre>'
+
+        result = formatter._format_code_blocks(html_block)
+
+        # Should be truncated (code block exceeds 15000-char limit)
+        assert "truncated" in result.lower()
+
+    def test_long_code_block_split_not_truncated(self, formatter):
+        """Test that moderately long code blocks are split, not truncated."""
+        long_code = "x" * 5000
         text = f"```python\n{long_code}\n```"
 
         messages = formatter.format_claude_response(text)
 
-        # Should be truncated
+        # Should be split across messages, not truncated
         assert len(messages) >= 1
-        assert "truncated" in messages[0].text.lower()
+        full_text = "".join(m.text for m in messages)
+        assert "truncated" not in full_text.lower()
 
     def test_quick_actions_keyboard(self, formatter):
         """Test quick actions keyboard generation."""
@@ -227,21 +245,93 @@ class TestResponseFormatter:
         assert len(keyboard.inline_keyboard[1]) == 1
 
     def test_message_splitting_preserves_code_blocks(self, formatter):
-        """Test that message splitting properly handles code blocks."""
-        # Create a message with code block that would be split
+        """Test that message splitting properly handles HTML code blocks."""
+        # Create a message with HTML code block that would be split
         code = "x" * 2000
-        text = f"Some text\n```\n{code}\n```\nMore text"
+        text = f"Some text\n<pre><code>{code}</code></pre>\nMore text"
 
         messages = formatter._split_message(text)
 
-        # Should properly close and reopen code blocks
+        # Should properly close and reopen code blocks across splits
         for msg in messages:
-            # Count opening and closing backticks
-            opening_count = msg.text.count("```\n")
-            closing_count = msg.text.count("\n```")
+            opening_count = msg.text.count("<pre><code>")
+            closing_count = msg.text.count("</code></pre>")
 
             # Should be balanced or have one extra opening (continued in next message)
             assert abs(opening_count - closing_count) <= 1
+
+
+class TestEscapeHtml:
+    """Test HTML escaping utility."""
+
+    def test_escape_ampersand(self):
+        assert escape_html("a & b") == "a &amp; b"
+
+    def test_escape_angle_brackets(self):
+        assert escape_html("<script>") == "&lt;script&gt;"
+
+    def test_no_change_for_safe_text(self):
+        assert escape_html("hello world") == "hello world"
+
+    def test_escape_all_three(self):
+        assert escape_html("a & <b> & c") == "a &amp; &lt;b&gt; &amp; c"
+
+
+class TestMarkdownToTelegramHtml:
+    """Test markdown to HTML conversion."""
+
+    def test_bold(self):
+        assert "<b>bold</b>" in markdown_to_telegram_html("**bold**")
+
+    def test_italic_asterisk(self):
+        assert "<i>italic</i>" in markdown_to_telegram_html("*italic*")
+
+    def test_italic_underscore_word_boundary(self):
+        result = markdown_to_telegram_html("_italic_")
+        assert "<i>italic</i>" in result
+
+    def test_underscore_in_identifier_not_converted(self):
+        result = markdown_to_telegram_html("my_var_name")
+        # Should NOT wrap in <i> tags since underscores are inside a word
+        assert "<i>" not in result
+
+    def test_inline_code(self):
+        result = markdown_to_telegram_html("`code here`")
+        assert "<code>code here</code>" in result
+
+    def test_fenced_code_block(self):
+        result = markdown_to_telegram_html("```python\nprint('hi')\n```")
+        assert "<pre>" in result
+        assert "<code" in result
+        assert "print" in result
+
+    def test_fenced_code_block_escapes_html(self):
+        result = markdown_to_telegram_html("```\n<script>alert(1)</script>\n```")
+        assert "&lt;script&gt;" in result
+
+    def test_link(self):
+        result = markdown_to_telegram_html("[text](https://example.com)")
+        assert '<a href="https://example.com">text</a>' in result
+
+    def test_header(self):
+        result = markdown_to_telegram_html("# My Header")
+        assert "<b>My Header</b>" in result
+
+    def test_strikethrough(self):
+        result = markdown_to_telegram_html("~~deleted~~")
+        assert "<s>deleted</s>" in result
+
+    def test_angle_brackets_escaped_in_text(self):
+        result = markdown_to_telegram_html("x < y > z")
+        assert "&lt;" in result
+        assert "&gt;" in result
+
+    def test_mixed_content(self):
+        text = "**Bold** and `code` and *italic*"
+        result = markdown_to_telegram_html(text)
+        assert "<b>Bold</b>" in result
+        assert "<code>code</code>" in result
+        assert "<i>italic</i>" in result
 
 
 class TestProgressIndicator:
@@ -310,17 +400,17 @@ class TestCodeHighlighter:
         code = "print('hello')"
         formatted = CodeHighlighter.format_code(code, "python")
 
-        assert formatted.startswith("```python\n")
-        assert formatted.endswith("\n```")
-        assert code in formatted
+        assert formatted.startswith('<pre><code class="language-python">')
+        assert formatted.endswith("</code></pre>")
+        assert "print" in formatted
 
     def test_format_code_without_language(self):
         """Test code formatting without language."""
         code = "some code"
         formatted = CodeHighlighter.format_code(code)
 
-        assert formatted.startswith("```\n")
-        assert formatted.endswith("\n```")
+        assert formatted.startswith("<pre><code>")
+        assert formatted.endswith("</code></pre>")
         assert code in formatted
 
     def test_format_code_with_filename(self):
@@ -328,7 +418,15 @@ class TestCodeHighlighter:
         code = "console.log('hello')"
         formatted = CodeHighlighter.format_code(code, filename="test.js")
 
-        assert "```javascript\n" in formatted
+        assert 'class="language-javascript"' in formatted
+
+    def test_format_code_escapes_html(self):
+        """Test that code formatting escapes HTML characters."""
+        code = "if (a < b && c > d) {}"
+        formatted = CodeHighlighter.format_code(code, "javascript")
+        assert "&lt;" in formatted
+        assert "&gt;" in formatted
+        assert "&amp;" in formatted
 
     def test_language_extensions_coverage(self):
         """Test that language extensions are properly mapped."""
@@ -340,3 +438,93 @@ class TestCodeHighlighter:
         assert CodeHighlighter.detect_language("test.cpp") == "cpp"
         assert CodeHighlighter.detect_language("test.go") == "go"
         assert CodeHighlighter.detect_language("test.rs") == "rust"
+
+
+TELEGRAM_HARD_LIMIT = 4096
+
+
+class TestOversizedResponseIntegration:
+    """End-to-end tests ensuring no formatted chunk exceeds Telegram's 4096-char limit.
+
+    These exercise the full format_claude_response pipeline: markdown→HTML
+    conversion, HTML escaping, code block handling, semantic chunking, and
+    message splitting.
+    """
+
+    def test_large_plain_text_stays_under_limit(self, formatter):
+        """Plain text response much larger than one message."""
+        # 12 000 chars of prose-like text with paragraph breaks
+        paragraph = "The quick brown fox jumps over the lazy dog. " * 10 + "\n\n"
+        text = paragraph * 30  # ~13 500 chars
+
+        messages = formatter.format_claude_response(text)
+
+        assert len(messages) > 1
+        for i, msg in enumerate(messages):
+            assert (
+                len(msg.text) <= TELEGRAM_HARD_LIMIT
+            ), f"Chunk {i} is {len(msg.text)} chars (limit {TELEGRAM_HARD_LIMIT})"
+
+    def test_large_code_block_stays_under_limit(self, formatter):
+        """A single huge code block must be split, not just truncated."""
+        # 10 000 chars of code — well above one message but below truncation
+        code_lines = [f"    result += process(item_{i})" for i in range(500)]
+        text = "```python\ndef big_function():\n" + "\n".join(code_lines) + "\n```"
+
+        messages = formatter.format_claude_response(text)
+
+        assert len(messages) > 1
+        for i, msg in enumerate(messages):
+            assert (
+                len(msg.text) <= TELEGRAM_HARD_LIMIT
+            ), f"Chunk {i} is {len(msg.text)} chars (limit {TELEGRAM_HARD_LIMIT})"
+
+    def test_html_entity_expansion_stays_under_limit(self, formatter):
+        """Characters that expand during HTML escaping (& → &amp; etc.)."""
+        # Each '&' becomes '&amp;' (5 chars), '<' becomes '&lt;' (4 chars)
+        # Build a response heavy with these characters
+        line = "if (a < b && c > d) { e &= f; }\n"
+        text = "```go\n" + line * 200 + "```"
+
+        messages = formatter.format_claude_response(text)
+
+        for i, msg in enumerate(messages):
+            assert len(msg.text) <= TELEGRAM_HARD_LIMIT, (
+                f"Chunk {i} is {len(msg.text)} chars after HTML escaping "
+                f"(limit {TELEGRAM_HARD_LIMIT})"
+            )
+
+    def test_mixed_content_stays_under_limit(self, formatter):
+        """Mixed markdown: headings, bold, code blocks, file-op lines."""
+        sections = []
+        for n in range(5):
+            sections.append(f"## Section {n}\n\n")
+            sections.append(f"Here is an **explanation** of step {n}.\n\n")
+            code = "\n".join([f'    print("step {n} line {j}")' for j in range(60)])
+            sections.append(f"```python\n{code}\n```\n\n")
+            sections.append(f"Creating file `output_{n}.py`\n\n")
+
+        text = "".join(sections)
+
+        messages = formatter.format_claude_response(text)
+
+        assert len(messages) > 1
+        for i, msg in enumerate(messages):
+            assert (
+                len(msg.text) <= TELEGRAM_HARD_LIMIT
+            ), f"Chunk {i} is {len(msg.text)} chars (limit {TELEGRAM_HARD_LIMIT})"
+        # All content should be present (not silently truncated)
+        full = "".join(m.text for m in messages)
+        assert "Section 0" in full
+        assert "Section 4" in full
+
+    def test_format_code_output_stays_under_limit(self, formatter):
+        """format_code_output (used for tool output) must also respect limit."""
+        output = "x = 1\n" * 2000  # ~12 000 chars
+
+        messages = formatter.format_code_output(output, "python", "Build Output")
+
+        for i, msg in enumerate(messages):
+            assert (
+                len(msg.text) <= TELEGRAM_HARD_LIMIT
+            ), f"Chunk {i} is {len(msg.text)} chars (limit {TELEGRAM_HARD_LIMIT})"

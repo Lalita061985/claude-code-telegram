@@ -1,6 +1,6 @@
 """Telegram bot authentication middleware."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Callable, Dict
 
 import structlog
@@ -86,7 +86,7 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
         if event.effective_message:
             await event.effective_message.reply_text(
                 f"🔓 Welcome! You are now authenticated.\n"
-                f"Session started at {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                f"Session started at {datetime.now(UTC).strftime('%H:%M:%S UTC')}"
             )
 
         # Continue to handler
@@ -98,11 +98,12 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
 
         if event.effective_message:
             await event.effective_message.reply_text(
-                "🔒 **Authentication Required**\n\n"
+                "🔒 <b>Authentication Required</b>\n\n"
                 "You are not authorized to use this bot.\n"
                 "Please contact the administrator for access.\n\n"
-                f"Your Telegram ID: `{user_id}`\n"
-                "Share this ID with the administrator to request access."
+                f"Your Telegram ID: <code>{user_id}</code>\n"
+                "Share this ID with the administrator to request access.",
+                parse_mode="HTML",
             )
         return  # Stop processing
 
@@ -152,8 +153,9 @@ async def admin_required(handler: Callable, event: Any, data: Dict[str, Any]) ->
     if "admin" not in permissions:
         if event.effective_message:
             await event.effective_message.reply_text(
-                "🔒 **Admin Access Required**\n\n"
-                "This command requires administrator privileges."
+                "🔒 <b>Admin Access Required</b>\n\n"
+                "This command requires administrator privileges.",
+                parse_mode="HTML",
             )
         return
 

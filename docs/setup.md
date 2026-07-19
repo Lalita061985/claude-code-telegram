@@ -1,137 +1,90 @@
 # Setup and Installation Guide
 
-This guide provides comprehensive instructions for setting up the Claude Code Telegram Bot with both CLI and SDK integration modes.
-
 ## Quick Start
 
 ### 1. Prerequisites
 
-- **Python 3.9+** - [Download here](https://www.python.org/downloads/)
-- **Poetry** - Modern Python dependency management
-- **Telegram Bot Token** - Get one from [@BotFather](https://t.me/botfather)
-- **Claude Authentication** - Choose one method below
+- **Python 3.11+** -- [Download here](https://www.python.org/downloads/)
+- **Telegram Bot Token** -- Get one from [@BotFather](https://t.me/botfather)
+- **Claude Authentication** -- Choose one method below
+- **For source installs:** [Poetry](https://python-poetry.org/docs/#installation)
 
 ### 2. Claude Authentication Setup
 
-The bot supports two Claude integration modes. Choose the one that fits your needs:
+The bot uses the Claude Code Python SDK. Choose your authentication method:
 
-#### Option A: SDK with CLI Authentication (Recommended)
+#### Option A: CLI Authentication (Recommended)
 
-This method uses the Python SDK for better performance while leveraging your existing Claude CLI authentication.
+Uses the SDK with your existing Claude CLI credentials.
 
 ```bash
-# 1. Install Claude CLI
-# Visit https://claude.ai/code and follow installation instructions
-
-# 2. Authenticate with Claude
+# 1. Install Claude CLI (https://claude.ai/code)
+# 2. Authenticate
 claude auth login
 
-# 3. Verify authentication
+# 3. Verify
 claude auth status
-# Should show: "✓ You are authenticated"
+# Should show: "You are authenticated"
 
-# 4. Configure bot (in step 4 below)
-USE_SDK=true
-# Leave ANTHROPIC_API_KEY empty - SDK will use CLI credentials
+# No ANTHROPIC_API_KEY needed — SDK uses CLI credentials
 ```
 
-**Pros:**
-- Best performance with native async support
-- Uses your existing Claude CLI authentication
-- Better streaming and error handling
-- No need to manage API keys separately
+#### Option B: Direct API Key
 
-**Cons:**
-- Requires Claude CLI installation
-
-#### Option B: SDK with Direct API Key
-
-This method uses the Python SDK with a direct API key, bypassing the need for Claude CLI.
+Uses the SDK with a direct API key, no CLI auth needed.
 
 ```bash
 # 1. Get your API key from https://console.anthropic.com/
-# 2. Configure bot (in step 4 below)
-USE_SDK=true
+# 2. Configure bot
 ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
 ```
 
-**Pros:**
-- No Claude CLI installation required
-- Direct API integration
-- Good performance with async support
-
-**Cons:**
-- Need to manage API keys manually
-- API key management and rotation
-
-#### Option C: CLI Subprocess Mode (Legacy)
-
-This method uses the Claude CLI as a subprocess. Use this only if you need compatibility with older setups.
-
-```bash
-# 1. Install Claude CLI
-# Visit https://claude.ai/code and follow installation instructions
-
-# 2. Authenticate with Claude
-claude auth login
-
-# 3. Configure bot (in step 4 below)
-USE_SDK=false
-# ANTHROPIC_API_KEY not needed for CLI mode
-```
-
-**Pros:**
-- Uses official Claude CLI
-- Compatible with all CLI features
-
-**Cons:**
-- Slower than SDK integration
-- Subprocess overhead
-- Less reliable error handling
-
 ### 3. Install the Bot
 
+Choose your preferred installation method:
+
+#### Option A: Install from a release tag (Recommended)
+
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/claude-code-telegram.git
+# Using uv (recommended — installs in an isolated environment)
+uv tool install git+https://github.com/RichardAtCT/claude-code-telegram@v1.3.0
+
+# Or using pip
+pip install git+https://github.com/RichardAtCT/claude-code-telegram@v1.3.0
+
+# Track the latest stable release
+pip install git+https://github.com/RichardAtCT/claude-code-telegram@latest
+```
+
+> **Don't have uv?** Install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`.
+
+#### Option B: From source (for development)
+
+```bash
+git clone https://github.com/RichardAtCT/claude-code-telegram.git
 cd claude-code-telegram
-
-# Install Poetry (if needed)
-curl -sSL https://install.python-poetry.org | python3 -
-
-# Install dependencies
 make dev
 ```
+
+> **Important:** Always install from a [tagged release](https://github.com/RichardAtCT/claude-code-telegram/releases), not `main`, for stability.
 
 ### 4. Configure Environment
 
 ```bash
-# Copy the example configuration
 cp .env.example .env
-
-# Edit with your settings
 nano .env
 ```
 
 **Required Configuration:**
 
 ```bash
-# Telegram Bot Settings
 TELEGRAM_BOT_TOKEN=1234567890:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
 TELEGRAM_BOT_USERNAME=your_bot_username
-
-# Security
 APPROVED_DIRECTORY=/path/to/your/projects
 ALLOWED_USERS=123456789  # Your Telegram user ID
-
-# Claude Integration (choose based on your authentication method above)
-USE_SDK=true                          # true for SDK, false for CLI
-ANTHROPIC_API_KEY=                    # Only needed for Option B above
 ```
 
 ### 5. Get Your Telegram User ID
-
-To configure `ALLOWED_USERS`:
 
 1. Message [@userinfobot](https://t.me/userinfobot) on Telegram
 2. It will reply with your user ID number
@@ -140,226 +93,273 @@ To configure `ALLOWED_USERS`:
 ### 6. Run the Bot
 
 ```bash
-# Start in debug mode (recommended for first run)
-make run-debug
-
-# Or for production
-make run
+make run-debug    # Recommended for first run
+make run          # Production
 ```
 
 ### 7. Test the Bot
 
 1. Find your bot on Telegram (search for your bot username)
 2. Send `/start` to begin
-3. Try a simple command like `/pwd` or `/ls`
-4. Test Claude integration with a simple question
+3. Try asking Claude a question about your project
+4. Use `/status` to check session info
+
+## Agentic Platform Setup
+
+The bot includes an event-driven platform for webhooks, scheduled jobs, and proactive notifications. All features are disabled by default.
+
+### Webhook API Server
+
+Enable to receive external webhooks (GitHub, etc.) and route them through Claude:
+
+```bash
+ENABLE_API_SERVER=true
+API_SERVER_PORT=8080
+```
+
+#### GitHub Webhook Setup
+
+1. Generate a webhook secret:
+   ```bash
+   openssl rand -hex 32
+   ```
+
+2. Add to your `.env`:
+   ```bash
+   GITHUB_WEBHOOK_SECRET=your-generated-secret
+   NOTIFICATION_CHAT_IDS=123456789  # Your Telegram chat ID for notifications
+   ```
+
+3. In your GitHub repository, go to **Settings > Webhooks > Add webhook**:
+   - **Payload URL**: `https://your-server:8080/webhooks/github`
+   - **Content type**: `application/json`
+   - **Secret**: The secret you generated
+   - **Events**: Choose which events to receive (push, pull_request, issues, etc.)
+
+4. Test with curl:
+   ```bash
+   curl -X POST http://localhost:8080/webhooks/github \
+     -H "Content-Type: application/json" \
+     -H "X-GitHub-Event: ping" \
+     -H "X-GitHub-Delivery: test-123" \
+     -H "X-Hub-Signature-256: sha256=$(echo -n '{"zen":"test"}' | openssl dgst -sha256 -hmac 'your-secret' | awk '{print $2}')" \
+     -d '{"zen":"test"}'
+   ```
+
+#### Generic Webhook Setup
+
+For non-GitHub providers, use Bearer token authentication:
+
+```bash
+WEBHOOK_API_SECRET=your-api-secret
+```
+
+Send webhooks with:
+```bash
+curl -X POST http://localhost:8080/webhooks/custom \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-secret" \
+  -H "X-Event-Type: deployment" \
+  -H "X-Delivery-ID: unique-id-123" \
+  -d '{"status": "success", "environment": "production"}'
+```
+
+### Job Scheduler
+
+Enable to run recurring Claude tasks on a cron schedule:
+
+```bash
+ENABLE_SCHEDULER=true
+NOTIFICATION_CHAT_IDS=123456789  # Where to deliver results
+```
+
+Jobs are managed programmatically and persist in the SQLite database.
+
+### Voice Message Transcription
+
+Enable voice message support with automatic transcription:
+
+```bash
+ENABLE_VOICE_MESSAGES=true
+```
+
+Choose your transcription provider:
+
+**Mistral Voxtral (default):**
+```bash
+VOICE_PROVIDER=mistral
+MISTRAL_API_KEY=your-mistral-api-key
+```
+
+**OpenAI Whisper:**
+```bash
+VOICE_PROVIDER=openai
+OPENAI_API_KEY=your-openai-api-key
+```
+
+**Local whisper.cpp (offline, no API key needed):**
+```bash
+VOICE_PROVIDER=local
+# Optional — auto-detected from PATH if unset
+WHISPER_CPP_BINARY_PATH=/usr/local/bin/whisper-cpp
+# Model name ("base", "small", "medium") or full path to .bin file
+WHISPER_CPP_MODEL_PATH=base
+```
+
+Requires `ffmpeg` and a locally built `whisper.cpp` binary. See the full [local whisper.cpp setup guide](local-whisper-cpp.md) for build instructions and model downloads.
+
+If you installed via pip/uv, make sure voice extras are installed (cloud providers only):
+```bash
+pip install "claude-code-telegram[voice]"
+```
+
+Optionally override the transcription model with `VOICE_TRANSCRIPTION_MODEL` (defaults to `voxtral-mini-latest` for Mistral, `whisper-1` for OpenAI, `base` for local).
+
+### Notification Recipients
+
+Configure which Telegram chats receive proactive notifications from webhooks and scheduled jobs:
+
+```bash
+NOTIFICATION_CHAT_IDS=123456789,987654321
+```
 
 ## Advanced Configuration
 
 ### Authentication Methods Comparison
 
-| Feature | SDK + CLI Auth | SDK + API Key | CLI Subprocess |
-|---------|----------------|---------------|----------------|
-| Performance | ✅ Best | ✅ Best | ❌ Slower |
-| Setup Complexity | 🟡 Medium | ✅ Easy | 🟡 Medium |
-| CLI Required | ✅ Yes | ❌ No | ✅ Yes |
-| API Key Management | ❌ No | ✅ Yes | ❌ No |
-| Streaming Support | ✅ Yes | ✅ Yes | 🟡 Limited |
-| Error Handling | ✅ Best | ✅ Best | 🟡 Basic |
+| Feature | SDK + CLI Auth | SDK + API Key |
+|---------|----------------|---------------|
+| Performance | Best | Best |
+| CLI Required | Yes | No |
+| Streaming | Yes | Yes |
 
-### Security Considerations
+### Security Configuration
 
 #### Directory Isolation
 ```bash
-# Set this to a specific project directory, not your home directory
+# Set to a specific project directory, not your home directory
 APPROVED_DIRECTORY=/Users/yourname/projects
-
-# The bot can only access files within this directory
-# This prevents access to sensitive system files
 ```
 
 #### User Access Control
 ```bash
-# Option 1: Whitelist specific users (recommended)
+# Whitelist specific users (recommended)
 ALLOWED_USERS=123456789,987654321
 
-# Option 2: Token-based authentication
+# Optional: Token-based authentication
 ENABLE_TOKEN_AUTH=true
-AUTH_TOKEN_SECRET=your-secret-key-here  # Generate with: openssl rand -hex 32
+AUTH_TOKEN_SECRET=your-secret-key-here
 ```
 
-### Rate Limiting Configuration
+### Rate Limiting
 
 ```bash
-# Prevent abuse with rate limiting
-RATE_LIMIT_REQUESTS=10          # Requests per window
-RATE_LIMIT_WINDOW=60            # Window in seconds
-RATE_LIMIT_BURST=20             # Burst capacity
-
-# Cost-based limiting
-CLAUDE_MAX_COST_PER_USER=10.0   # Max cost per user in USD
+RATE_LIMIT_REQUESTS=10
+RATE_LIMIT_WINDOW=60
+RATE_LIMIT_BURST=20
+CLAUDE_MAX_COST_PER_USER=10.0
 ```
 
 ### Development Setup
 
-For development work:
-
 ```bash
-# Development-specific settings
 DEBUG=true
 DEVELOPMENT_MODE=true
 LOG_LEVEL=DEBUG
 ENVIRONMENT=development
-
-# More lenient rate limits for testing
 RATE_LIMIT_REQUESTS=100
 CLAUDE_TIMEOUT_SECONDS=600
 ```
 
+## Running on a Remote Mac (SSH)
+
+If you're running the bot on a remote Mac Mini (or any Mac accessed via SSH), Claude Code's OAuth tokens stored in the macOS keychain will be inaccessible because the keychain is locked in SSH sessions. This causes Claude invocations to fail silently or with authentication errors.
+
+### Quick Start: `make run-remote`
+
+The simplest fix is to unlock the keychain before starting the bot:
+
+```bash
+make run-remote
+```
+
+This prompts for your keychain password, then starts the bot in a detached tmux session that persists after SSH disconnect. Manage the session with:
+
+```bash
+make remote-attach   # View logs
+make remote-stop     # Kill the bot
+```
+
+### Alternative: Unlock Keychain in Shell Profile
+
+Add this to your `~/.zshrc` or `~/.bash_profile` so the keychain unlocks automatically on SSH login:
+
+```bash
+if [ -n "$SSH_CONNECTION" ] && [ -z "$KEYCHAIN_UNLOCKED" ]; then
+  security unlock-keychain ~/Library/Keychains/login.keychain-db
+  export KEYCHAIN_UNLOCKED=true
+fi
+```
+
+### Extend Keychain Lock Timeout
+
+By default the keychain re-locks after a short idle period. Set it to 8 hours:
+
+```bash
+security set-keychain-settings -t 28800 ~/Library/Keychains/login.keychain-db
+```
+
+### Alternative: Use an API Key Instead
+
+Bypass the keychain entirely by using a direct API key (Option B in the authentication section above). Set `ANTHROPIC_API_KEY` in your `.env` and the keychain is never consulted.
+
 ## Troubleshooting
 
-### Common Setup Issues
-
-#### Bot doesn't respond
+### Bot doesn't respond
 ```bash
 # Check your bot token
 echo $TELEGRAM_BOT_TOKEN
 
-# Verify user ID is correct
-# Message @userinfobot to get your ID
-
+# Verify user ID (message @userinfobot)
 # Check bot logs
 make run-debug
 ```
 
-#### Claude authentication issues
+### Claude authentication issues
 
-**For SDK + CLI Auth:**
+**SDK + CLI Auth:**
 ```bash
-# Check CLI authentication
 claude auth status
-
-# Should show: "✓ You are authenticated"
-# If not, run: claude auth login
+# If not authenticated: claude auth login
 ```
 
-**For SDK + API Key:**
+**SDK + API Key:**
 ```bash
-# Verify API key is set
+# Verify key starts with: sk-ant-api03-
 echo $ANTHROPIC_API_KEY
-
-# Should start with: sk-ant-api03-
-# Get a new key from: https://console.anthropic.com/
 ```
 
-**For CLI Mode:**
-```bash
-# Check CLI installation
-claude --version
-
-# Check authentication
-claude auth status
-
-# Test CLI works
-claude "Hello, can you help me?"
-```
-
-#### Permission errors
+### Permission errors
 ```bash
 # Check approved directory exists and is accessible
 ls -la /path/to/your/projects
-
-# Verify bot process has read/write permissions
-# The directory should be owned by the user running the bot
-```
-
-### Performance Optimization
-
-#### For SDK Mode
-```bash
-# Optimal settings for SDK integration
-USE_SDK=true
-CLAUDE_TIMEOUT_SECONDS=300
-CLAUDE_MAX_TURNS=20
-```
-
-#### For CLI Mode
-```bash
-# If you must use CLI mode, optimize these settings
-USE_SDK=false
-CLAUDE_TIMEOUT_SECONDS=450      # Higher timeout for subprocess overhead
-CLAUDE_MAX_TURNS=10             # Lower turns to reduce subprocess calls
-```
-
-### Monitoring and Logging
-
-#### Enable detailed logging
-```bash
-LOG_LEVEL=DEBUG
-DEBUG=true
-
-# Run with debug output
-make run-debug
-```
-
-#### Monitor usage and costs
-```bash
-# Check usage in Telegram
-/status
-
-# Monitor logs for cost tracking
-tail -f logs/bot.log | grep -i cost
 ```
 
 ## Production Deployment
 
-### Environment-specific settings
-
 ```bash
-# Production configuration
 ENVIRONMENT=production
 DEBUG=false
 LOG_LEVEL=INFO
-DEVELOPMENT_MODE=false
-
-# Stricter rate limits
 RATE_LIMIT_REQUESTS=5
 CLAUDE_MAX_COST_PER_USER=5.0
 SESSION_TIMEOUT_HOURS=12
-
-# Enable monitoring
 ENABLE_TELEMETRY=true
-SENTRY_DSN=https://your-sentry-dsn@sentry.io/project
-```
-
-### Database configuration
-
-```bash
-# For production, use a persistent database location
-DATABASE_URL=sqlite:///var/lib/claude-telegram/bot.db
-
-# Or use PostgreSQL for high-scale deployments
-# DATABASE_URL=postgresql://user:pass@localhost/claude_telegram
-```
-
-### Security hardening
-
-```bash
-# Enable token authentication for additional security
-ENABLE_TOKEN_AUTH=true
-AUTH_TOKEN_SECRET=your-very-secure-secret-key
-
-# Restrict to specific users only
-ALLOWED_USERS=123456789,987654321
-
-# Use a restricted project directory
-APPROVED_DIRECTORY=/opt/projects
 ```
 
 ## Getting Help
 
 - **Documentation**: Check the main [README.md](../README.md)
 - **Configuration**: See [configuration.md](configuration.md) for all options
-- **Development**: See [development.md](development.md) for development setup
-- **Issues**: [Open an issue](https://github.com/yourusername/claude-code-telegram/issues)
 - **Security**: See [SECURITY.md](../SECURITY.md) for security concerns
+- **Issues**: [Open an issue](https://github.com/RichardAtCT/claude-code-telegram/issues)

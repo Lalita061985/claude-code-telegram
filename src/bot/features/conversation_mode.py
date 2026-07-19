@@ -30,7 +30,7 @@ from typing import Dict, List, Optional
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from ...claude.integration import ClaudeResponse
+from ...claude.sdk_integration import ClaudeResponse
 
 logger = structlog.get_logger()
 
@@ -328,22 +328,27 @@ class ConversationEnhancer:
         self,
         response: ClaudeResponse,
         context: ConversationContext,
-        max_content_length: int = 3000,
+        max_content_length: int = 50000,
     ) -> tuple[str, Optional[InlineKeyboardMarkup]]:
         """Format response with follow-up suggestions."""
-        # Truncate content if too long for Telegram
+        # Truncate content only for extremely large responses;
+        # normal splitting into multiple Telegram messages is handled by the caller.
         content = response.content
         if len(content) > max_content_length:
-            content = content[:max_content_length] + "\n\n... _(response truncated)_"
+            content = (
+                content[:max_content_length] + "\n\n... <i>(response truncated)</i>"
+            )
 
         # Add session info if this is a new session
         if context.conversation_turn == 1 and response.session_id:
-            session_info = f"\n\n🆔 **Session:** `{response.session_id[:8]}...`"
+            session_info = (
+                f"\n\n🆔 <b>Session:</b> <code>{response.session_id[:8]}...</code>"
+            )
             content += session_info
 
         # Add cost info if significant
         if response.cost > 0.01:
-            cost_info = f"\n\n💰 **Cost:** ${response.cost:.4f}"
+            cost_info = f"\n\n💰 <b>Cost:</b> ${response.cost:.4f}"
             content += cost_info
 
         # Generate follow-up suggestions

@@ -16,7 +16,7 @@ This project is currently under active development with the following status:
 
 ### Prerequisites
 
-- Python 3.9 or higher
+- Python 3.11 or higher
 - Poetry for dependency management
 - Git for version control
 
@@ -32,6 +32,25 @@ This project is currently under active development with the following status:
    ```bash
    make dev
    ```
+   This also installs **pre-commit hooks** that automatically format your code (black, isort) on each commit, so you never need to worry about formatting manually.
+
+   > **Linux users**: If `make dev` shows a `DBusErrorResponse` / `ItemNotFoundException`
+   > error for `aiolimiter`, this is a known Poetry keyring issue on Linux. To prevent
+   > it, disable the keyring backend before running `make dev`:
+   > ```bash
+   > PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring make dev
+   > ```
+   > Or configure Poetry once to disable keyring globally:
+   > ```bash
+   > poetry config keyring.enabled false
+   > make dev
+   > ```
+   > If you already ran `make dev` and see 2 test failures, install `aiolimiter`
+   > manually and re-run tests:
+   > ```bash
+   > poetry run pip install aiolimiter
+   > make test
+   > ```
 
 3. **Set up configuration**:
    ```bash
@@ -250,6 +269,7 @@ Fixes #123
 - [ ] Manual testing completed
 
 ## Checklist
+- [ ] `make format` has been run (or pre-commit hooks are installed via `make dev`)
 - [ ] Code follows project style guidelines
 - [ ] Self-review completed
 - [ ] Documentation updated

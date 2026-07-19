@@ -119,6 +119,23 @@ def _validate_config(settings: Settings) -> None:
     if settings.enable_token_auth and not settings.auth_token_secret:
         raise InvalidConfigError("Token auth enabled but no secret provided")
 
+    if settings.enable_project_threads:
+        if (
+            settings.project_threads_mode == "group"
+            and settings.project_threads_chat_id is None
+        ):
+            raise InvalidConfigError(
+                "Project thread mode is 'group' but no project_threads_chat_id provided"
+            )
+        if not settings.projects_config_path:
+            raise InvalidConfigError(
+                "Project thread mode enabled but no projects_config_path provided"
+            )
+        if not settings.projects_config_path.exists():
+            raise InvalidConfigError(
+                f"Projects config not found: {settings.projects_config_path}"
+            )
+
     # Validate database path for SQLite
     if settings.database_url.startswith("sqlite:///"):
         db_path = settings.database_path
@@ -139,6 +156,9 @@ def _validate_config(settings: Settings) -> None:
     # Validate cost limits
     if settings.claude_max_cost_per_user <= 0:
         raise InvalidConfigError("claude_max_cost_per_user must be positive")
+
+    if settings.claude_max_cost_per_request <= 0:
+        raise InvalidConfigError("claude_max_cost_per_request must be positive")
 
 
 def _get_enabled_features_summary(settings: Settings) -> list[str]:

@@ -4,13 +4,12 @@ This document provides comprehensive information about configuring the Claude Co
 
 ## Overview
 
-The bot uses a sophisticated configuration system built with Pydantic Settings v2 that provides:
+The bot uses a configuration system built with Pydantic Settings v2 that provides:
 
 - **Type Safety**: All configuration values are validated and type-checked
 - **Environment Support**: Automatic environment-specific overrides
 - **Feature Flags**: Dynamic enabling/disabling of functionality
 - **Validation**: Cross-field validation and runtime checks
-- **Documentation**: Self-documenting configuration with descriptions
 
 ## Configuration Sources
 
@@ -24,8 +23,6 @@ Configuration is loaded in this order (later sources override earlier ones):
 ## Environment Variables
 
 ### Required Settings
-
-These settings MUST be provided for the bot to start:
 
 ```bash
 # Telegram Bot Configuration
@@ -49,12 +46,23 @@ ENABLE_TOKEN_AUTH=false
 AUTH_TOKEN_SECRET=your-secret-key-here
 ```
 
+#### Security Relaxation (Trusted Environments Only)
+
+```bash
+# Disable dangerous pattern validation in SecurityValidator (default: false)
+# WARNING: This allows characters such as pipes and redirections in validated paths.
+DISABLE_SECURITY_PATTERNS=false
+
+# Disable ToolMonitor allowlist/disallowlist checks (default: false)
+# WARNING: This only skips tool-name allow/disallow checks; path and Bash safety checks still apply.
+DISABLE_TOOL_VALIDATION=false
+```
+
 #### Claude Configuration
 
 ```bash
-# Integration Method
-USE_SDK=true                          # Use Python SDK (default) or CLI subprocess
-ANTHROPIC_API_KEY=sk-ant-api03-...    # Optional: API key for SDK integration
+# Authentication
+ANTHROPIC_API_KEY=sk-ant-api03-...    # Optional: API key for SDK (uses CLI auth if omitted)
 
 # Maximum conversation turns before requiring new session
 CLAUDE_MAX_TURNS=10
@@ -62,11 +70,14 @@ CLAUDE_MAX_TURNS=10
 # Timeout for Claude operations in seconds
 CLAUDE_TIMEOUT_SECONDS=300
 
-# Maximum cost per user in USD
+# Maximum cost per user in USD (lifetime budget for rate limiter)
 CLAUDE_MAX_COST_PER_USER=10.0
 
-# Allowed Claude tools (comma-separated list)
-CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,Glob,Grep,LS,Task,MultiEdit,NotebookRead,NotebookEdit,WebFetch,TodoRead,TodoWrite,WebSearch
+# Maximum cost per individual request in USD (SDK-level hard cap)
+CLAUDE_MAX_COST_PER_REQUEST=5.0
+
+# Allowed Claude tools (comma-separated list; see docs/tools.md for descriptions)
+CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,Glob,Grep,LS,Task,TaskOutput,MultiEdit,NotebookRead,NotebookEdit,WebFetch,TodoRead,TodoWrite,WebSearch
 ```
 
 #### Rate Limiting
@@ -92,13 +103,18 @@ DATABASE_URL=sqlite:///data/bot.db
 SESSION_TIMEOUT_HOURS=24           # Session timeout in hours
 MAX_SESSIONS_PER_USER=5            # Max concurrent sessions per user
 
-# Database connection
-DATABASE_CONNECTION_POOL_SIZE=5    # Connection pool size
-DATABASE_TIMEOUT_SECONDS=30       # Database operation timeout
-
 # Data retention
 DATA_RETENTION_DAYS=90            # Days to keep old data
 AUDIT_LOG_RETENTION_DAYS=365     # Days to keep audit logs
+```
+
+#### Mode Selection
+
+```bash
+# Agentic mode (default: true)
+# true = conversational mode with 3 commands (/start, /new, /status)
+# false = classic terminal mode with 13 commands and inline keyboards
+AGENTIC_MODE=true
 ```
 
 #### Feature Flags
@@ -108,15 +124,82 @@ AUDIT_LOG_RETENTION_DAYS=365     # Days to keep audit logs
 ENABLE_MCP=false
 MCP_CONFIG_PATH=/path/to/mcp/config.json
 
-# Enable Git integration
+# Enable Git integration (classic mode)
 ENABLE_GIT_INTEGRATION=true
 
 # Enable file upload handling
 ENABLE_FILE_UPLOADS=true
 
-# Enable quick action buttons
+# Enable quick action buttons (classic mode)
 ENABLE_QUICK_ACTIONS=true
+
+# Enable voice message transcription
+ENABLE_VOICE_MESSAGES=true
+VOICE_PROVIDER=mistral              # 'mistral', 'openai', or 'local'
+MISTRAL_API_KEY=                     # Required when VOICE_PROVIDER=mistral
+OPENAI_API_KEY=                      # Required when VOICE_PROVIDER=openai
+VOICE_TRANSCRIPTION_MODEL=           # Default: voxtral-mini-latest (Mistral) or whisper-1 (OpenAI)
+VOICE_MAX_FILE_SIZE_MB=20            # Max Telegram voice file size to download (1-200MB)
+
+# Local whisper.cpp settings (only used when VOICE_PROVIDER=local)
+WHISPER_CPP_BINARY_PATH=             # Path to whisper.cpp binary (auto-detected from PATH if unset)
+WHISPER_CPP_MODEL_PATH=base          # Path to GGML model file or model name (base, small, medium, large)
 ```
+
+#### Agentic Platform
+
+```bash
+# Webhook API Server
+ENABLE_API_SERVER=false               # Enable FastAPI webhook server
+API_SERVER_PORT=8080                  # Server port (default: 8080)
+
+# Webhook Authentication
+GITHUB_WEBHOOK_SECRET=your-secret    # GitHub HMAC-SHA256 secret
+WEBHOOK_API_SECRET=your-secret       # Bearer token for generic providers
+
+# Job Scheduler
+ENABLE_SCHEDULER=false                # Enable cron job scheduler
+
+# Notifications
+NOTIFICATION_CHAT_IDS=123456,789012  # Default Telegram chat IDs for proactive notifications
+```
+
+#### Project Thread Mode
+
+```bash
+# Strict project routing via Telegram project topics
+ENABLE_PROJECT_THREADS=false
+
+# Mode: private (default) or group
+PROJECT_THREADS_MODE=private
+
+# YAML registry file with project slugs/names/paths
+PROJECTS_CONFIG_PATH=config/projects.yaml
+
+# Required only for PROJECT_THREADS_MODE=group
+PROJECT_THREADS_CHAT_ID=-1001234567890
+
+# Minimum delay (seconds) between Telegram API calls during topic sync
+# Set 0 to disable pacing
+PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS=1.1
+```
+
+`PROJECTS_CONFIG_PATH` schema:
+
+```yaml
+projects:
+  - slug: my-app
+    name: My App
+    path: my-app
+    enabled: true
+```
+
+When `ENABLE_PROJECT_THREADS=true`:
+- `PROJECT_THREADS_MODE=private`:
+  - `/start` and `/sync_threads` are allowed outside topics in private chat.
+  - all other updates must be inside mapped project topics.
+- `PROJECT_THREADS_MODE=group`:
+  - behavior remains forum-topic based using `PROJECT_THREADS_CHAT_ID`.
 
 #### Monitoring & Logging
 
@@ -144,7 +227,7 @@ DEVELOPMENT_MODE=false
 ENVIRONMENT=development
 ```
 
-#### Webhook (Optional)
+#### Webhook (Telegram Polling vs Webhook)
 
 ```bash
 # Webhook URL for bot (leave empty for polling mode)
@@ -177,23 +260,20 @@ Activated when `ENVIRONMENT=development` or when `DEBUG=true`:
 Activated when `ENVIRONMENT=testing`:
 
 - `debug = true`
-- `development_mode = true`
 - `database_url = "sqlite:///:memory:"` (in-memory database)
 - `approved_directory = "/tmp/test_projects"`
-- `enable_telemetry = false`
 - `claude_timeout_seconds = 30` (faster timeout)
 - `rate_limit_requests = 1000` (no effective rate limiting)
-- `session_timeout_hours = 1` (short timeout)
 
 ### Production Environment
 
 Activated when `ENVIRONMENT=production`:
 
 - `debug = false`
-- `development_mode = false`
 - `log_level = "INFO"`
 - `enable_telemetry = true`
 - `claude_max_cost_per_user = 5.0` (stricter cost limit)
+- `claude_max_cost_per_request = 2.0` (per-request SDK cap)
 - `rate_limit_requests = 5` (stricter rate limiting)
 - `session_timeout_hours = 12` (shorter session timeout)
 
@@ -207,24 +287,28 @@ from src.config import load_config, FeatureFlags
 config = load_config()
 features = FeatureFlags(config)
 
-if features.git_enabled:
-    # Enable git commands
+if features.agentic_mode_enabled:
+    # Use agentic mode handlers
     pass
 
-if features.mcp_enabled:
-    # Enable Model Context Protocol
+if features.api_server_enabled:
+    # Start webhook API server
     pass
 ```
 
 Available feature flags:
 
+- `agentic_mode_enabled`: Agentic conversational mode (default: true)
+- `api_server_enabled`: Webhook API server
+- `scheduler_enabled`: Cron job scheduler
 - `mcp_enabled`: Model Context Protocol support
 - `git_enabled`: Git integration commands
 - `file_uploads_enabled`: File upload handling
 - `quick_actions_enabled`: Quick action buttons
 - `telemetry_enabled`: Anonymous usage telemetry
 - `token_auth_enabled`: Token-based authentication
-- `webhook_enabled`: Webhook mode (vs polling)
+- `webhook_enabled`: Telegram webhook mode (vs polling)
+- `voice_messages_enabled`: Voice message transcription (default: true)
 - `development_features_enabled`: Development-only features
 
 ## Validation
@@ -240,6 +324,8 @@ The configuration system performs extensive validation:
 
 - `AUTH_TOKEN_SECRET` is required when `ENABLE_TOKEN_AUTH=true`
 - `MCP_CONFIG_PATH` is required when `ENABLE_MCP=true`
+- `MISTRAL_API_KEY` is required when `VOICE_PROVIDER=mistral`
+- `OPENAI_API_KEY` is required when `VOICE_PROVIDER=openai`
 
 ### Value Validation
 
@@ -247,45 +333,19 @@ The configuration system performs extensive validation:
 - Numeric values must be positive where appropriate
 - User IDs in `ALLOWED_USERS` must be valid integers
 
-## Configuration Loading in Code
+## Claude Integration Options
 
-### Basic Usage
+### Authentication Options
 
-```python
-from src.config import load_config
-
-# Load with automatic environment detection
-config = load_config()
-
-# Access configuration
-bot_token = config.telegram_token_str
-max_cost = config.claude_max_cost_per_user
+#### Option 1: Use Existing Claude CLI Authentication (Recommended)
+```bash
+# No ANTHROPIC_API_KEY needed - SDK will use CLI credentials
+# Ensure Claude CLI is installed and authenticated: claude auth login
 ```
 
-### Environment-Specific Loading
-
-```python
-from src.config import load_config
-
-# Explicitly load production config
-config = load_config(env="production")
-
-# Check if running in production
-if config.is_production:
-    # Production-specific behavior
-    pass
-```
-
-### Testing Configuration
-
-```python
-from src.config import create_test_config
-
-# Create test config with overrides
-config = create_test_config(
-    claude_max_turns=5,
-    debug=True
-)
+#### Option 2: Direct API Key
+```bash
+ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
 ```
 
 ## Troubleshooting
@@ -305,19 +365,6 @@ config = create_test_config(
    - Ensure `MCP_CONFIG_PATH` points to an existing file
    - Or disable MCP with `ENABLE_MCP=false`
 
-### Debug Configuration
-
-To see what configuration is loaded:
-
-```bash
-export TELEGRAM_BOT_TOKEN=test
-export TELEGRAM_BOT_USERNAME=test  
-export APPROVED_DIRECTORY=/tmp
-make run-debug
-```
-
-This will show detailed logging of configuration loading and validation.
-
 ## Security Considerations
 
 - **Never commit secrets** to version control
@@ -325,89 +372,3 @@ This will show detailed logging of configuration loading and validation.
 - **Rotate tokens regularly** if using token-based auth
 - **Restrict `APPROVED_DIRECTORY`** to only necessary paths
 - **Monitor logs** for configuration errors and security events
-
-## Claude Integration Options
-
-### SDK vs CLI Mode
-
-The bot supports two integration methods with Claude:
-
-1. **SDK Mode (Default)**: Uses the Claude Code Python SDK for direct API integration
-   - Better performance and streaming support
-   - Can use existing Claude CLI authentication or API key
-   - More reliable error handling
-
-2. **CLI Mode**: Uses Claude Code CLI subprocess
-   - Requires Claude Code CLI installation
-   - Uses CLI authentication only
-   - Legacy mode for compatibility
-
-### Authentication Options
-
-#### Option 1: Use Existing Claude CLI Authentication (Recommended)
-```bash
-# Install and authenticate Claude CLI
-claude auth login
-
-# Configure bot to use SDK with CLI auth
-USE_SDK=true
-# No ANTHROPIC_API_KEY needed - SDK will use CLI credentials
-```
-
-#### Option 2: Direct API Key
-```bash
-# Configure bot with API key
-USE_SDK=true
-ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
-```
-
-#### Option 3: CLI Mode (Legacy)
-```bash
-# Use CLI subprocess instead of SDK
-USE_SDK=false
-# Requires Claude CLI to be installed and authenticated
-```
-
-## Example .env File
-
-```bash
-# Telegram Configuration
-TELEGRAM_BOT_TOKEN=1234567890:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
-TELEGRAM_BOT_USERNAME=my_claude_bot
-
-# Security
-APPROVED_DIRECTORY=/home/user/projects
-ALLOWED_USERS=123456789,987654321
-
-# Optional: Token Authentication
-ENABLE_TOKEN_AUTH=false
-AUTH_TOKEN_SECRET=
-
-# Claude Integration
-USE_SDK=true                          # Use Python SDK (recommended)
-ANTHROPIC_API_KEY=                    # Optional: Only if not using CLI auth
-
-# Rate Limiting
-RATE_LIMIT_REQUESTS=10
-RATE_LIMIT_WINDOW=60
-
-# Claude Settings
-CLAUDE_MAX_COST_PER_USER=10.0
-CLAUDE_TIMEOUT_SECONDS=300
-CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,Glob,Grep,LS,Task,MultiEdit,NotebookRead,NotebookEdit,WebFetch,TodoRead,TodoWrite,WebSearch
-
-# Storage & Database
-DATABASE_URL=sqlite:///data/bot.db
-SESSION_TIMEOUT_HOURS=24
-MAX_SESSIONS_PER_USER=5
-DATA_RETENTION_DAYS=90
-
-# Features
-ENABLE_GIT_INTEGRATION=true
-ENABLE_FILE_UPLOADS=true
-ENABLE_QUICK_ACTIONS=true
-
-# Development
-DEBUG=false
-LOG_LEVEL=INFO
-```

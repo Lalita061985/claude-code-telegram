@@ -3,10 +3,12 @@
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
 
+import src.config.loader as config_loader
 from src.config import Settings, create_test_config, load_config
 from src.config.features import FeatureFlags
 from src.exceptions import ConfigurationError
@@ -69,6 +71,28 @@ def test_allowed_users_parsing_with_spaces():
         )
 
         assert settings.allowed_users == [123, 456, 789]
+
+
+def test_security_relaxation_settings_defaults_and_overrides():
+    """Security relaxation settings should default to False and be configurable."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        defaults = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+        )
+        assert defaults.disable_security_patterns is False
+        assert defaults.disable_tool_validation is False
+
+        overridden = Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=tmp_dir,
+            disable_security_patterns=True,
+            disable_tool_validation=True,
+        )
+        assert overridden.disable_security_patterns is True
+        assert overridden.disable_tool_validation is True
 
 
 def test_approved_directory_validation_nonexistent():
@@ -158,9 +182,57 @@ def test_mcp_config_validation(tmp_path, monkeypatch):
 
     assert "does not exist" in str(exc_info.value)
 
-    # Should succeed when config file exists
+    # Should fail when config file is not valid JSON
+    bad_json_file = tmp_path / "bad.json"
+    bad_json_file.write_text("not json at all")
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(test_dir),
+            enable_mcp=True,
+            mcp_config_path=str(bad_json_file),
+        )
+
+    assert "not valid JSON" in str(exc_info.value)
+
+    # Should fail when config file is missing mcpServers key
+    no_servers_file = tmp_path / "no_servers.json"
+    no_servers_file.write_text('{"test": true}')
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(test_dir),
+            enable_mcp=True,
+            mcp_config_path=str(no_servers_file),
+        )
+
+    assert "mcpServers" in str(exc_info.value)
+
+    # Should fail when mcpServers is empty
+    empty_servers_file = tmp_path / "empty_servers.json"
+    empty_servers_file.write_text('{"mcpServers": {}}')
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(test_dir),
+            enable_mcp=True,
+            mcp_config_path=str(empty_servers_file),
+        )
+
+    assert "at least one server" in str(exc_info.value)
+
+    # Should succeed with valid MCP config
     config_file = tmp_path / "mcp_config.json"
-    config_file.write_text('{"test": true}')
+    config_file.write_text(
+        '{"mcpServers": {"my-server": '
+        '{"command": "npx", "args": ["-y", "my-mcp-server"]}}}'
+    )
 
     settings = Settings(
         telegram_bot_token="test_token",
@@ -199,6 +271,262 @@ def test_log_level_validation():
         assert settings.log_level == "DEBUG"
 
 
+def test_project_threads_validation_requires_chat_id_in_group_mode(tmp_path):
+    """Group thread mode requires project_threads_chat_id."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+    app_dir = project_dir / "app"
+    app_dir.mkdir()
+    config_file = tmp_path / "projects.yaml"
+    config_file.write_text(
+        "projects:\n" "  - slug: app\n" "    name: App\n" "    path: app\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(project_dir),
+            enable_project_threads=True,
+            project_threads_mode="group",
+            projects_config_path=str(config_file),
+        )
+
+    assert "project_threads_chat_id required" in str(exc_info.value)
+
+
+def test_project_threads_validation_requires_projects_config(tmp_path):
+    """Thread mode requires projects_config_path."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(project_dir),
+            enable_project_threads=True,
+            project_threads_chat_id=-1001234567890,
+            projects_config_path=None,
+        )
+
+    assert "projects_config_path required" in str(exc_info.value)
+
+
+def test_project_threads_validation_blank_projects_config_path_fails(tmp_path):
+    """Blank projects_config_path should be treated as missing."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(project_dir),
+            enable_project_threads=True,
+            project_threads_mode="private",
+            projects_config_path="",
+        )
+
+    assert "projects_config_path required" in str(exc_info.value)
+
+
+def test_project_threads_validation_private_mode_no_chat_id(tmp_path):
+    """Private thread mode does not require project_threads_chat_id."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+    app_dir = project_dir / "app"
+    app_dir.mkdir()
+    config_file = tmp_path / "projects.yaml"
+    config_file.write_text(
+        "projects:\n" "  - slug: app\n" "    name: App\n" "    path: app\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        enable_project_threads=True,
+        project_threads_mode="private",
+        projects_config_path=str(config_file),
+    )
+
+    assert settings.project_threads_mode == "private"
+    assert settings.project_threads_chat_id is None
+
+
+def test_project_threads_validation_private_mode_empty_chat_id(tmp_path):
+    """Private mode accepts blank project_threads_chat_id from env/.env."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+    app_dir = project_dir / "app"
+    app_dir.mkdir()
+    config_file = tmp_path / "projects.yaml"
+    config_file.write_text(
+        "projects:\n" "  - slug: app\n" "    name: App\n" "    path: app\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        enable_project_threads=True,
+        project_threads_mode="private",
+        project_threads_chat_id="",
+        projects_config_path=str(config_file),
+    )
+
+    assert settings.project_threads_mode == "private"
+    assert settings.project_threads_chat_id is None
+
+
+def test_project_threads_validation_group_mode_empty_chat_id_fails(tmp_path):
+    """Group mode rejects blank project_threads_chat_id."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+    app_dir = project_dir / "app"
+    app_dir.mkdir()
+    config_file = tmp_path / "projects.yaml"
+    config_file.write_text(
+        "projects:\n" "  - slug: app\n" "    name: App\n" "    path: app\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(project_dir),
+            enable_project_threads=True,
+            project_threads_mode="group",
+            project_threads_chat_id="",
+            projects_config_path=str(config_file),
+        )
+
+    assert "project_threads_chat_id required" in str(exc_info.value)
+
+
+def test_project_threads_sync_action_interval_validation(tmp_path):
+    """Thread sync action interval should accept non-negative values only."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        project_threads_sync_action_interval_seconds=0,
+    )
+    assert settings.project_threads_sync_action_interval_seconds == 0
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        project_threads_sync_action_interval_seconds="1.1",
+    )
+    assert settings.project_threads_sync_action_interval_seconds == pytest.approx(1.1)
+
+    with pytest.raises(ValidationError):
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(project_dir),
+            project_threads_sync_action_interval_seconds=-0.1,
+        )
+
+
+def test_project_threads_validation_invalid_mode(tmp_path):
+    """Invalid project thread mode should fail validation."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(project_dir),
+            enable_project_threads=True,
+            project_threads_mode="invalid",
+        )
+
+    assert "project_threads_mode must be one of" in str(exc_info.value)
+
+
+def test_voice_provider_validation_and_normalization(tmp_path):
+    """VOICE_PROVIDER accepts mistral/openai/local and normalizes casing."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        voice_provider="OPENAI",
+    )
+
+    assert settings.voice_provider == "openai"
+    assert settings.voice_provider_api_key_env == "OPENAI_API_KEY"
+    assert settings.voice_provider_display_name == "OpenAI Whisper"
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(project_dir),
+            voice_provider="google",
+        )
+
+    assert "voice_provider must be one of" in str(exc_info.value)
+
+
+def test_voice_provider_local_requires_no_api_key(tmp_path):
+    """VOICE_PROVIDER=local needs no API key and has correct display properties."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        voice_provider="local",
+    )
+
+    assert settings.voice_provider == "local"
+    assert settings.voice_provider_api_key_env == ""
+    assert settings.voice_provider_display_name == "Local whisper.cpp"
+    assert settings.resolved_voice_model == "base"
+    assert settings.resolved_whisper_cpp_binary == "whisper-cpp"
+    assert settings.resolved_whisper_cpp_model_path.endswith("ggml-base.bin")
+
+
+def test_voice_max_file_size_configuration(tmp_path):
+    """Voice max file size should be configurable and validated."""
+    project_dir = tmp_path / "projects"
+    project_dir.mkdir()
+
+    settings = Settings(
+        telegram_bot_token="test_token",
+        telegram_bot_username="test_bot",
+        approved_directory=str(project_dir),
+        voice_max_file_size_mb=32,
+    )
+
+    assert settings.voice_max_file_size_mb == 32
+    assert settings.voice_max_file_size_bytes == 32 * 1024 * 1024
+
+    with pytest.raises(ValidationError):
+        Settings(
+            telegram_bot_token="test_token",
+            telegram_bot_username="test_bot",
+            approved_directory=str(project_dir),
+            voice_max_file_size_mb=0,
+        )
+
+
 def test_computed_properties(tmp_path):
     """Test computed properties."""
     test_dir = tmp_path / "projects"
@@ -234,12 +562,15 @@ def test_computed_properties(tmp_path):
 
 def test_feature_flags():
     """Test feature flag system."""
-    # Create test MCP config file before creating settings
-    Path("/tmp/test.json").write_text('{"test": true}')
+    # Create test MCP config file with valid structure before creating settings
+    mcp_config = (
+        '{"mcpServers": {"test-server": {"command": "echo", "args": ["hello"]}}}'
+    )
+    Path("/tmp/test_mcp.json").write_text(mcp_config)
 
     settings = create_test_config(
         enable_mcp=True,
-        mcp_config_path="/tmp/test.json",
+        mcp_config_path="/tmp/test_mcp.json",
         enable_git_integration=True,
         enable_file_uploads=False,
         enable_token_auth=True,
@@ -264,7 +595,7 @@ def test_feature_flags():
     assert features.is_feature_enabled("nonexistent") is False
 
     # Cleanup test file
-    Path("/tmp/test.json").unlink(missing_ok=True)
+    Path("/tmp/test_mcp.json").unlink(missing_ok=True)
 
 
 def test_environment_loading():
@@ -294,6 +625,39 @@ def test_environment_loading():
                 "APPROVED_DIRECTORY",
             ]:
                 os.environ.pop(key, None)
+
+
+def test_load_config_does_not_log_api_keys(tmp_path):
+    """Startup/error logs should not include raw provider API keys."""
+    secrets = {
+        "ANTHROPIC_API_KEY": "sk-ant-api03-sensitive-anthropic-token-value",
+        "MISTRAL_API_KEY": "mistral-sensitive-token-value-123",
+        "OPENAI_API_KEY": "sk-sensitive-openai-token-value-456",
+    }
+
+    os.environ["TELEGRAM_BOT_TOKEN"] = "test_token"
+    os.environ["TELEGRAM_BOT_USERNAME"] = "test_bot"
+    os.environ["APPROVED_DIRECTORY"] = str(tmp_path)
+    for key, value in secrets.items():
+        os.environ[key] = value
+
+    try:
+        with patch.object(config_loader, "logger") as mock_logger:
+            load_config(env="development", config_file=tmp_path / "missing.env")
+            logged_text = " ".join(str(call) for call in mock_logger.mock_calls)
+
+        for value in secrets.values():
+            assert value not in logged_text
+    finally:
+        for key in [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_BOT_USERNAME",
+            "APPROVED_DIRECTORY",
+            "ANTHROPIC_API_KEY",
+            "MISTRAL_API_KEY",
+            "OPENAI_API_KEY",
+        ]:
+            os.environ.pop(key, None)
 
 
 def test_create_test_config():

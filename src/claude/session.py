@@ -1,30 +1,27 @@
-"""Claude Code session management.
+"""Claude Code session management."""
 
-Features:
-- Session state tracking
-- Multi-project support
-- Session persistence
-- Cleanup policies
-"""
-
-import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 import structlog
 
 from ..config.settings import Settings
-
-if TYPE_CHECKING:
-    from .integration import ClaudeResponse as CLIClaudeResponse
-    from .sdk_integration import ClaudeResponse as SDKClaudeResponse
-
-# Union type for both CLI and SDK responses
-ClaudeResponse = Union["CLIClaudeResponse", "SDKClaudeResponse"]
+from .sdk_integration import ClaudeResponse
 
 logger = structlog.get_logger()
+
+
+def _to_utc(dt: datetime) -> datetime:
+    """Normalize datetime to timezone-aware UTC.
+
+    Backward compatibility: legacy persisted sessions may contain naive
+    timestamps; treat naive values as UTC.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 @dataclass
@@ -44,12 +41,12 @@ class ClaudeSession:
 
     def is_expired(self, timeout_hours: int) -> bool:
         """Check if session has expired."""
-        age = datetime.utcnow() - self.last_used
+        age = datetime.now(UTC) - _to_utc(self.last_used)
         return age > timedelta(hours=timeout_hours)
 
     def update_usage(self, response: ClaudeResponse) -> None:
         """Update session with usage from response."""
-        self.last_used = datetime.utcnow()
+        self.last_used = _to_utc(datetime.now(UTC))
         self.total_cost += response.cost
         self.total_turns += response.num_turns
         self.message_count += 1
@@ -82,8 +79,8 @@ class ClaudeSession:
             session_id=data["session_id"],
             user_id=data["user_id"],
             project_path=Path(data["project_path"]),
-            created_at=datetime.fromisoformat(data["created_at"]),
-            last_used=datetime.fromisoformat(data["last_used"]),
+            created_at=_to_utc(datetime.fromisoformat(data["created_at"])),
+            last_used=_to_utc(datetime.fromisoformat(data["last_used"])),
             total_cost=data.get("total_cost", 0.0),
             total_turns=data.get("total_turns", 0),
             message_count=data.get("message_count", 0),
@@ -98,8 +95,10 @@ class SessionStorage:
         """Save session to storage."""
         raise NotImplementedError
 
-    async def load_session(self, session_id: str) -> Optional[ClaudeSession]:
-        """Load session from storage."""
+    async def load_session(
+        self, session_id: str, user_id: int
+    ) -> Optional[ClaudeSession]:
+        """Load session owned by user_id from storage."""
         raise NotImplementedError
 
     async def delete_session(self, session_id: str) -> None:
@@ -113,42 +112,6 @@ class SessionStorage:
     async def get_all_sessions(self) -> List[ClaudeSession]:
         """Get all sessions."""
         raise NotImplementedError
-
-
-class InMemorySessionStorage(SessionStorage):
-    """In-memory session storage for development/testing."""
-
-    def __init__(self):
-        """Initialize in-memory storage."""
-        self.sessions: Dict[str, ClaudeSession] = {}
-
-    async def save_session(self, session: ClaudeSession) -> None:
-        """Save session to memory."""
-        self.sessions[session.session_id] = session
-        logger.debug("Session saved to memory", session_id=session.session_id)
-
-    async def load_session(self, session_id: str) -> Optional[ClaudeSession]:
-        """Load session from memory."""
-        session = self.sessions.get(session_id)
-        if session:
-            logger.debug("Session loaded from memory", session_id=session_id)
-        return session
-
-    async def delete_session(self, session_id: str) -> None:
-        """Delete session from memory."""
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-            logger.debug("Session deleted from memory", session_id=session_id)
-
-    async def get_user_sessions(self, user_id: int) -> List[ClaudeSession]:
-        """Get all sessions for a user."""
-        return [
-            session for session in self.sessions.values() if session.user_id == user_id
-        ]
-
-    async def get_all_sessions(self) -> List[ClaudeSession]:
-        """Get all sessions."""
-        return list(self.sessions.values())
 
 
 class SessionManager:
@@ -177,13 +140,20 @@ class SessionManager:
         # Check for existing session
         if session_id and session_id in self.active_sessions:
             session = self.active_sessions[session_id]
-            if not session.is_expired(self.config.session_timeout_hours):
+            if session.user_id != user_id:
+                logger.warning(
+                    "Session ownership mismatch in active cache",
+                    session_id=session_id,
+                    session_owner=session.user_id,
+                    requesting_user=user_id,
+                )
+            elif not session.is_expired(self.config.session_timeout_hours):
                 logger.debug("Using active session", session_id=session_id)
                 return session
 
-        # Try to load from storage
+        # Try to load from storage (filtered by user_id)
         if session_id:
-            session = await self.storage.load_session(session_id)
+            session = await self.storage.load_session(session_id, user_id)
             if session and not session.is_expired(self.config.session_timeout_hours):
                 self.active_sessions[session_id] = session
                 logger.info("Loaded session from storage", session_id=session_id)
@@ -201,75 +171,62 @@ class SessionManager:
                 user_id=user_id,
             )
 
-        # Create new session with temporary ID until Claude Code provides real session_id
-        temp_session_id = f"temp_{str(uuid.uuid4())}"
+        # Create session with empty ID — Claude will provide the real one
         new_session = ClaudeSession(
-            session_id=temp_session_id,
+            session_id="",
             user_id=user_id,
             project_path=project_path,
-            created_at=datetime.utcnow(),
-            last_used=datetime.utcnow(),
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
+            is_new_session=True,
         )
 
-        # Mark as new session (not from Claude Code yet)
-        new_session.is_new_session = True
-
-        # Save to storage
-        await self.storage.save_session(new_session)
-        self.active_sessions[new_session.session_id] = new_session
+        # Don't save to storage yet — deferred until after Claude responds
+        # with a real session_id (via update_session)
 
         logger.info(
-            "Created new session",
-            session_id=new_session.session_id,
+            "Created new session (pending Claude session ID)",
             user_id=user_id,
             project_path=str(project_path),
         )
 
         return new_session
 
-    async def update_session(self, session_id: str, response: ClaudeResponse) -> None:
-        """Update session with response data."""
-        if session_id in self.active_sessions:
-            session = self.active_sessions[session_id]
-            old_session_id = session.session_id
-
-            # For new sessions, update to Claude's actual session ID
-            if (
-                hasattr(session, "is_new_session")
-                and session.is_new_session
-                and response.session_id
-            ):
-                # Remove old temporary session
-                del self.active_sessions[old_session_id]
-                await self.storage.delete_session(old_session_id)
-
-                # Update session with Claude's session ID
+    async def update_session(
+        self, session: ClaudeSession, response: ClaudeResponse
+    ) -> None:
+        """Update session with response data and persist."""
+        if session.is_new_session:
+            # Assign the real session ID from Claude
+            if response.session_id:
                 session.session_id = response.session_id
-                session.is_new_session = False
-
-                # Store with new session ID
-                self.active_sessions[response.session_id] = session
-
-                logger.info(
-                    "Session ID updated from temporary to Claude session ID",
-                    old_session_id=old_session_id,
-                    new_session_id=response.session_id,
+            else:
+                logger.warning(
+                    "Claude returned no session_id for new session; "
+                    "session will not be resumable",
+                    user_id=session.user_id,
+                    project_path=str(session.project_path),
                 )
-            elif hasattr(session, "is_new_session") and session.is_new_session:
-                # Mark as no longer new even if no session_id from Claude
-                session.is_new_session = False
+            session.is_new_session = False
 
-            session.update_usage(response)
+            logger.info(
+                "New session assigned Claude session ID",
+                session_id=session.session_id,
+            )
 
-            # Persist to storage
+        session.update_usage(response)
+
+        # Persist to storage and track as active
+        if session.session_id:
+            self.active_sessions[session.session_id] = session
             await self.storage.save_session(session)
 
-            logger.debug(
-                "Session updated",
-                session_id=session.session_id,
-                total_cost=session.total_cost,
-                message_count=session.message_count,
-            )
+        logger.debug(
+            "Session updated",
+            session_id=session.session_id,
+            total_cost=session.total_cost,
+            message_count=session.message_count,
+        )
 
     async def remove_session(self, session_id: str) -> None:
         """Remove session."""
@@ -298,12 +255,21 @@ class SessionManager:
         """Get all sessions for a user."""
         return await self.storage.get_user_sessions(user_id)
 
-    async def get_session_info(self, session_id: str) -> Optional[Dict]:
-        """Get session information."""
+    async def get_session_info(self, session_id: str, user_id: int) -> Optional[Dict]:
+        """Get session info dict for a session owned by user_id."""
         session = self.active_sessions.get(session_id)
 
+        if session and session.user_id != user_id:
+            logger.warning(
+                "Session ownership mismatch in get_session_info",
+                session_id=session_id,
+                session_owner=session.user_id,
+                requesting_user=user_id,
+            )
+            session = None
+
         if not session:
-            session = await self.storage.load_session(session_id)
+            session = await self.storage.load_session(session_id, user_id)
 
         if session:
             return {

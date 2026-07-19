@@ -1,107 +1,49 @@
-"""Claude Code Python SDK integration.
-
-Features:
-- Native Claude Code SDK integration
-- Async streaming support
-- Tool execution management
-- Session persistence
-"""
+"""Claude Code Python SDK integration."""
 
 import asyncio
 import os
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import structlog
-from claude_code_sdk import (
-    ClaudeCodeOptions,
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
     ClaudeSDKError,
     CLIConnectionError,
+    CLIJSONDecodeError,
     CLINotFoundError,
     Message,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ProcessError,
-    query,
-)
-from claude_code_sdk.types import (
-    AssistantMessage,
     ResultMessage,
     TextBlock,
-    ToolResultBlock,
+    ThinkingBlock,
+    ToolPermissionContext,
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk._errors import MessageParseError
+from claude_agent_sdk._internal.message_parser import parse_message
+from claude_agent_sdk.types import StreamEvent
 
 from ..config.settings import Settings
+from ..security.validators import SecurityValidator
 from .exceptions import (
+    ClaudeMCPError,
     ClaudeParsingError,
     ClaudeProcessError,
     ClaudeTimeoutError,
 )
+from .monitor import _is_claude_internal_path, check_bash_directory_boundary
 
 logger = structlog.get_logger()
 
-
-def find_claude_cli(claude_cli_path: Optional[str] = None) -> Optional[str]:
-    """Find Claude CLI in common locations."""
-    import glob
-    import shutil
-
-    # First check if a specific path was provided via config or env
-    if claude_cli_path:
-        if os.path.exists(claude_cli_path) and os.access(claude_cli_path, os.X_OK):
-            return claude_cli_path
-
-    # Check CLAUDE_CLI_PATH environment variable
-    env_path = os.environ.get("CLAUDE_CLI_PATH")
-    if env_path and os.path.exists(env_path) and os.access(env_path, os.X_OK):
-        return env_path
-
-    # Check if claude is already in PATH
-    claude_path = shutil.which("claude")
-    if claude_path:
-        return claude_path
-
-    # Check common installation locations
-    common_paths = [
-        # NVM installations
-        os.path.expanduser("~/.nvm/versions/node/*/bin/claude"),
-        # Direct npm global install
-        os.path.expanduser("~/.npm-global/bin/claude"),
-        os.path.expanduser("~/node_modules/.bin/claude"),
-        # System locations
-        "/usr/local/bin/claude",
-        "/usr/bin/claude",
-        # Windows locations (for cross-platform support)
-        os.path.expanduser("~/AppData/Roaming/npm/claude.cmd"),
-    ]
-
-    for pattern in common_paths:
-        matches = glob.glob(pattern)
-        if matches:
-            # Return the first match
-            return matches[0]
-
-    return None
-
-
-def update_path_for_claude(claude_cli_path: Optional[str] = None) -> bool:
-    """Update PATH to include Claude CLI if found."""
-    claude_path = find_claude_cli(claude_cli_path)
-
-    if claude_path:
-        # Add the directory containing claude to PATH
-        claude_dir = os.path.dirname(claude_path)
-        current_path = os.environ.get("PATH", "")
-
-        if claude_dir not in current_path:
-            os.environ["PATH"] = f"{claude_dir}:{current_path}"
-            logger.info("Updated PATH for Claude CLI", claude_path=claude_path)
-
-        return True
-
-    return False
+# Fallback message when Claude produces no text but did use tools.
+TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
 
 
 @dataclass
@@ -116,32 +58,197 @@ class ClaudeResponse:
     is_error: bool = False
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
+    interrupted: bool = False
 
 
 @dataclass
 class StreamUpdate:
     """Streaming update from Claude SDK."""
 
-    type: str  # 'assistant', 'user', 'system', 'result'
+    type: str  # 'assistant', 'user', 'system', 'result', 'stream_delta'
     content: Optional[str] = None
-    tool_calls: Optional[List[Dict]] = None
-    metadata: Optional[Dict] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    progress: Optional[Dict[str, Any]] = None
+
+    def get_tool_names(self) -> List[str]:
+        """Return tool names from the stream payload."""
+        names: List[str] = []
+
+        if self.tool_calls:
+            for tool_call in self.tool_calls:
+                name = tool_call.get("name") if isinstance(tool_call, dict) else None
+                if isinstance(name, str) and name:
+                    names.append(name)
+
+        if self.metadata:
+            tool_name = self.metadata.get("tool_name")
+            if isinstance(tool_name, str) and tool_name:
+                names.append(tool_name)
+
+            metadata_tools = self.metadata.get("tools")
+            if isinstance(metadata_tools, list):
+                for tool in metadata_tools:
+                    if isinstance(tool, dict):
+                        name = tool.get("name")
+                    elif isinstance(tool, str):
+                        name = tool
+                    else:
+                        name = None
+
+                    if isinstance(name, str) and name:
+                        names.append(name)
+
+        # Preserve insertion order while de-duplicating.
+        return list(dict.fromkeys(names))
+
+    def is_error(self) -> bool:
+        """Check whether this stream update represents an error."""
+        if self.type == "error":
+            return True
+
+        if self.metadata:
+            if self.metadata.get("is_error") is True:
+                return True
+            status = self.metadata.get("status")
+            if isinstance(status, str) and status.lower() == "error":
+                return True
+            error_val = self.metadata.get("error")
+            if isinstance(error_val, str) and error_val:
+                return True
+            error_msg_val = self.metadata.get("error_message")
+            if isinstance(error_msg_val, str) and error_msg_val:
+                return True
+
+        if self.progress:
+            status = self.progress.get("status")
+            if isinstance(status, str) and status.lower() == "error":
+                return True
+
+        return False
+
+    def get_error_message(self) -> str:
+        """Get the best available error message from the stream payload."""
+        if self.metadata:
+            for key in ("error_message", "error", "message"):
+                value = self.metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+
+        if isinstance(self.content, str) and self.content.strip():
+            return self.content
+
+        if self.progress:
+            value = self.progress.get("error")
+            if isinstance(value, str) and value.strip():
+                return value
+
+        return "Unknown error"
+
+    def get_progress_percentage(self) -> Optional[int]:
+        """Extract progress percentage if present."""
+
+        def _to_int(value: Any) -> Optional[int]:
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str) and value.strip():
+                try:
+                    return int(float(value))
+                except ValueError:
+                    return None
+            return None
+
+        if self.progress:
+            for key in ("percentage", "percent", "progress"):
+                percentage = _to_int(self.progress.get(key))
+                if percentage is not None:
+                    return max(0, min(100, percentage))
+
+            step = _to_int(self.progress.get("step"))
+            total_steps = _to_int(self.progress.get("total_steps"))
+            if step is not None and total_steps and total_steps > 0:
+                return max(0, min(100, int((step / total_steps) * 100)))
+
+        if self.metadata:
+            percentage = _to_int(self.metadata.get("progress_percentage"))
+            if percentage is not None:
+                return max(0, min(100, percentage))
+
+        return None
+
+
+def _make_can_use_tool_callback(
+    security_validator: SecurityValidator,
+    working_directory: Path,
+    approved_directory: Path,
+) -> Any:
+    """Create a can_use_tool callback for SDK-level tool permission validation.
+
+    The callback validates file path boundaries and bash directory boundaries
+    *before* the SDK executes the tool, providing preventive security enforcement.
+    """
+    _FILE_TOOLS = {"Write", "Edit", "Read", "create_file", "edit_file", "read_file"}
+    _BASH_TOOLS = {"Bash", "bash", "shell"}
+
+    async def can_use_tool(
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> Any:
+        # File path validation
+        if tool_name in _FILE_TOOLS:
+            file_path = tool_input.get("file_path") or tool_input.get("path")
+            if file_path:
+                # Allow Claude Code internal paths (~/.claude/plans/, etc.)
+                if _is_claude_internal_path(file_path):
+                    return PermissionResultAllow()
+
+                valid, _resolved, error = security_validator.validate_path(
+                    file_path, working_directory
+                )
+                if not valid:
+                    logger.warning(
+                        "can_use_tool denied file operation",
+                        tool_name=tool_name,
+                        file_path=file_path,
+                        error=error,
+                    )
+                    return PermissionResultDeny(message=error or "Invalid file path")
+
+        # Bash directory boundary validation
+        if tool_name in _BASH_TOOLS:
+            command = tool_input.get("command", "")
+            if command:
+                valid, error = check_bash_directory_boundary(
+                    command, working_directory, approved_directory
+                )
+                if not valid:
+                    logger.warning(
+                        "can_use_tool denied bash command",
+                        tool_name=tool_name,
+                        command=command,
+                        error=error,
+                    )
+                    return PermissionResultDeny(
+                        message=error or "Bash directory boundary violation"
+                    )
+
+        return PermissionResultAllow()
+
+    return can_use_tool
 
 
 class ClaudeSDKManager:
     """Manage Claude Code SDK integration."""
 
-    def __init__(self, config: Settings):
+    def __init__(
+        self,
+        config: Settings,
+        security_validator: Optional[SecurityValidator] = None,
+    ):
         """Initialize SDK manager with configuration."""
         self.config = config
-        self.active_sessions: Dict[str, Dict[str, Any]] = {}
-
-        # Try to find and update PATH for Claude CLI
-        if not update_path_for_claude(config.claude_cli_path):
-            logger.warning(
-                "Claude CLI not found in PATH or common locations. "
-                "SDK may fail if Claude is not installed or not in PATH."
-            )
+        self.security_validator = security_validator
 
         # Set up environment for Claude Code SDK if API key is provided
         # If no API key is provided, the SDK will use existing CLI authentication
@@ -151,6 +258,16 @@ class ClaudeSDKManager:
         else:
             logger.info("No API key provided, using existing Claude CLI authentication")
 
+    def _is_retryable_error(self, exc: BaseException) -> bool:
+        """Return True for transient errors that warrant a retry.
+        asyncio.TimeoutError is intentional (user-configured timeout) — not retried.
+        Only non-MCP CLIConnectionError is considered transient.
+        """
+        if isinstance(exc, CLIConnectionError):
+            msg = str(exc).lower()
+            return "mcp" not in msg  # "server" alone is too broad
+        return False
+
     async def execute_command(
         self,
         prompt: str,
@@ -158,6 +275,8 @@ class ClaudeSDKManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
+        images: Optional[List[Dict[str, str]]] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -170,46 +289,310 @@ class ClaudeSDKManager:
         )
 
         try:
-            # Build Claude Code options
-            options = ClaudeCodeOptions(
+            # Capture stderr from Claude CLI for better error diagnostics
+            stderr_lines: List[str] = []
+
+            def _stderr_callback(line: str) -> None:
+                stderr_lines.append(line)
+                logger.debug("Claude CLI stderr", line=line)
+
+            # Build system prompt, loading CLAUDE.md from working directory if present
+            base_prompt = (
+                f"All file operations must stay within {working_directory}. "
+                "Use relative paths."
+            )
+            claude_md_path = Path(working_directory) / "CLAUDE.md"
+            if claude_md_path.exists():
+                base_prompt += "\n\n" + claude_md_path.read_text(encoding="utf-8")
+                logger.info(
+                    "Loaded CLAUDE.md into system prompt",
+                    path=str(claude_md_path),
+                )
+
+            # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
+            # tools so the SDK does not restrict tool usage (e.g. MCP tools).
+            if self.config.disable_tool_validation:
+                sdk_allowed_tools = None
+                sdk_disallowed_tools = None
+            else:
+                sdk_allowed_tools = self.config.claude_allowed_tools
+                sdk_disallowed_tools = self.config.claude_disallowed_tools
+
+            # Build Claude Agent options
+            options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
+                model=self.config.claude_model or None,
+                max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
-                allowed_tools=self.config.claude_allowed_tools,
+                allowed_tools=sdk_allowed_tools,
+                disallowed_tools=sdk_disallowed_tools,
+                cli_path=self.config.claude_cli_path or None,
+                include_partial_messages=stream_callback is not None,
+                sandbox={
+                    "enabled": self.config.sandbox_enabled,
+                    "autoAllowBashIfSandboxed": True,
+                    "excludedCommands": self.config.sandbox_excluded_commands or [],
+                },
+                system_prompt=base_prompt,
+                setting_sources=["project"],
+                stderr=_stderr_callback,
             )
 
-            # Collect messages
-            messages = []
-            cost = 0.0
-            tools_used = []
+            # Pass MCP server configuration if enabled
+            if self.config.enable_mcp and self.config.mcp_config_path:
+                options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
+                logger.info(
+                    "MCP servers configured",
+                    mcp_config_path=str(self.config.mcp_config_path),
+                )
 
-            # Execute with streaming and timeout
-            await asyncio.wait_for(
-                self._execute_query_with_streaming(
-                    prompt, options, messages, stream_callback
-                ),
-                timeout=self.config.claude_timeout_seconds,
-            )
+            # Wire can_use_tool callback for preventive tool validation
+            if self.security_validator:
+                options.can_use_tool = _make_can_use_tool_callback(
+                    security_validator=self.security_validator,
+                    working_directory=working_directory,
+                    approved_directory=self.config.approved_directory,
+                )
 
-            # Extract cost and tools from result message
+            # Resume previous session if we have a session_id
+            if session_id and continue_session:
+                options.resume = session_id
+                logger.info(
+                    "Resuming previous session",
+                    session_id=session_id,
+                )
+
+            # Collect messages via ClaudeSDKClient
+            messages: List[Message] = []
+            interrupted = False
+
+            async def _run_client() -> None:
+                client = ClaudeSDKClient(options)
+                try:
+                    await client.connect()
+
+                    if images:
+                        content_blocks: List[Dict[str, Any]] = []
+                        for img in images:
+                            media_type = img.get("media_type", "image/png")
+                            content_blocks.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": img["data"],
+                                    },
+                                }
+                            )
+                        content_blocks.append({"type": "text", "text": prompt})
+
+                        multimodal_msg = {
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": content_blocks,
+                            },
+                        }
+
+                        async def _multimodal_prompt() -> AsyncIterator[Dict[str, Any]]:
+                            yield multimodal_msg
+
+                        await client.query(_multimodal_prompt())
+                    else:
+                        await client.query(prompt)
+
+                    async for raw_data in client._query.receive_messages():
+                        try:
+                            message = parse_message(raw_data)
+                        except MessageParseError as e:
+                            logger.debug(
+                                "Skipping unparseable message",
+                                error=str(e),
+                            )
+                            continue
+
+                        messages.append(message)
+
+                        if isinstance(message, ResultMessage):
+                            break
+
+                        # Handle streaming callback
+                        if stream_callback:
+                            try:
+                                await self._handle_stream_message(
+                                    message, stream_callback
+                                )
+                            except Exception as callback_error:
+                                logger.warning(
+                                    "Stream callback failed",
+                                    error=str(callback_error),
+                                    error_type=type(callback_error).__name__,
+                                )
+                finally:
+                    await client.disconnect()
+
+            # Execute with timeout and retry, racing against optional interrupt
+            max_attempts = max(1, self.config.claude_retry_max_attempts)
+            last_exc: Optional[BaseException] = None
+
+            for attempt in range(max_attempts):
+                # Reset message accumulator each attempt so that a failed attempt
+                # does not pollute the next one with partial/duplicate messages.
+                # _run_client() closes over `messages` by reference (late-binding
+                # closure), so clearing it here is seen by every new call.
+                messages.clear()
+
+                if attempt > 0:
+                    delay = min(
+                        self.config.claude_retry_base_delay
+                        * (self.config.claude_retry_backoff_factor ** (attempt - 1)),
+                        self.config.claude_retry_max_delay,
+                    )
+                    logger.warning(
+                        "Retrying Claude SDK command",
+                        attempt=attempt + 1,
+                        max_attempts=max_attempts,
+                        delay_seconds=delay,
+                    )
+                    await asyncio.sleep(delay)
+
+                run_task = asyncio.create_task(_run_client())
+
+                interrupt_watcher: Optional["asyncio.Task[None]"] = None
+                if interrupt_event is not None:
+
+                    async def _cancel_on_interrupt() -> None:
+                        nonlocal interrupted
+                        await interrupt_event.wait()
+                        interrupted = True
+                        run_task.cancel()
+
+                    interrupt_watcher = asyncio.create_task(_cancel_on_interrupt())
+
+                # Note: asyncio.TimeoutError is intentionally NOT retried —
+                # it reflects a user-configured hard limit.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(run_task),
+                        timeout=self.config.claude_timeout_seconds,
+                    )
+                    break  # success — exit retry loop
+                except asyncio.CancelledError:
+                    if not interrupted:
+                        raise
+                    # Interrupt cancelled the task — wait for cleanup
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+                    break  # user interrupted — don't retry
+                except asyncio.TimeoutError:
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+                    raise  # timeout — don't retry
+                except CLIConnectionError as exc:
+                    if self._is_retryable_error(exc) and attempt < max_attempts - 1:
+                        last_exc = exc
+                        logger.warning(
+                            "Transient connection error, will retry",
+                            attempt=attempt + 1,
+                            error=str(exc),
+                        )
+                        continue
+                    raise  # non-retryable or attempts exhausted
+                finally:
+                    if interrupt_watcher is not None:
+                        interrupt_watcher.cancel()
+            else:
+                if last_exc is not None:
+                    raise last_exc
+
+            # Extract cost, tools, and session_id from result message
             cost = 0.0
-            tools_used = []
+            tools_used: List[Dict[str, Any]] = []
+            claude_session_id = None
+            result_content = None
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
-                    tools_used = self._extract_tools_from_messages(messages)
+                    claude_session_id = getattr(message, "session_id", None)
+                    result_content = getattr(message, "result", None)
+                    current_time = asyncio.get_event_loop().time()
+                    for msg in messages:
+                        if isinstance(msg, AssistantMessage):
+                            msg_content = getattr(msg, "content", [])
+                            if msg_content and isinstance(msg_content, list):
+                                for block in msg_content:
+                                    if isinstance(block, ToolUseBlock):
+                                        tools_used.append(
+                                            {
+                                                "name": getattr(
+                                                    block, "name", "unknown"
+                                                ),
+                                                "timestamp": current_time,
+                                                "input": getattr(block, "input", {}),
+                                            }
+                                        )
                     break
+
+            # Fallback: extract session_id from StreamEvent messages if
+            # ResultMessage didn't provide one (can happen with some CLI versions)
+            if not claude_session_id:
+                for message in messages:
+                    msg_session_id = getattr(message, "session_id", None)
+                    if msg_session_id and not isinstance(message, ResultMessage):
+                        claude_session_id = msg_session_id
+                        logger.info(
+                            "Got session ID from stream event (fallback)",
+                            session_id=claude_session_id,
+                        )
+                        break
 
             # Calculate duration
             duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
 
-            # Get or create session ID
-            final_session_id = session_id or str(uuid.uuid4())
+            # Use Claude's session_id if available, otherwise fall back
+            final_session_id = claude_session_id or session_id or ""
 
-            # Update session
-            self._update_session(final_session_id, messages)
+            if claude_session_id and claude_session_id != session_id:
+                logger.info(
+                    "Got session ID from Claude",
+                    claude_session_id=claude_session_id,
+                    previous_session_id=session_id,
+                )
+
+            # Use ResultMessage.result if available, fall back to message extraction
+            if result_content is not None:
+                content = str(result_content).strip()
+            else:
+                content_parts = []
+                for msg in messages:
+                    if isinstance(msg, AssistantMessage):
+                        msg_content = getattr(msg, "content", [])
+                        if msg_content and isinstance(msg_content, list):
+                            for block in msg_content:
+                                if hasattr(block, "text"):
+                                    content_parts.append(block.text)
+                        elif msg_content:
+                            content_parts.append(str(msg_content))
+                content = "\n".join(content_parts).strip()
+
+            if not content and tools_used:
+                tool_names = [
+                    tool.get("name", "")
+                    for tool in tools_used
+                    if isinstance(tool.get("name"), str) and tool.get("name")
+                ]
+                unique_tool_names = list(dict.fromkeys(tool_names))
+                tools_summary = ", ".join(unique_tool_names) or "unknown"
+                content = TASK_COMPLETED_MSG.format(tools_summary=tools_summary)
 
             return ClaudeResponse(
-                content=self._extract_content_from_messages(messages),
+                content=content,
                 session_id=final_session_id,
                 cost=cost,
                 duration_ms=duration_ms,
@@ -221,6 +604,7 @@ class ClaudeSDKManager:
                     ]
                 ),
                 tools_used=tools_used,
+                interrupted=interrupted,
             )
 
         except asyncio.TimeoutError:
@@ -245,114 +629,93 @@ class ClaudeSDKManager:
             raise ClaudeProcessError(error_msg)
 
         except ProcessError as e:
+            error_str = str(e)
+            # Include captured stderr for better diagnostics
+            captured_stderr = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
+            if captured_stderr:
+                error_str = f"{error_str}\nStderr: {captured_stderr}"
             logger.error(
                 "Claude process failed",
-                error=str(e),
+                error=error_str,
                 exit_code=getattr(e, "exit_code", None),
+                stderr=captured_stderr or None,
             )
-            raise ClaudeProcessError(f"Claude process error: {str(e)}")
+            # Check if the process error is MCP-related
+            if "mcp" in error_str.lower():
+                raise ClaudeMCPError(f"MCP server error: {error_str}")
+            raise ClaudeProcessError(f"Claude process error: {error_str}")
 
         except CLIConnectionError as e:
-            logger.error("Claude connection error", error=str(e))
-            raise ClaudeProcessError(f"Failed to connect to Claude: {str(e)}")
+            error_str = str(e)
+            logger.error("Claude connection error", error=error_str)
+            # Check if the connection error is MCP-related
+            if "mcp" in error_str.lower() or "server" in error_str.lower():
+                raise ClaudeMCPError(f"MCP server connection failed: {error_str}")
+            raise ClaudeProcessError(f"Failed to connect to Claude: {error_str}")
+
+        except CLIJSONDecodeError as e:
+            logger.error("Claude SDK JSON decode error", error=str(e))
+            raise ClaudeParsingError(f"Failed to decode Claude response: {str(e)}")
 
         except ClaudeSDKError as e:
             logger.error("Claude SDK error", error=str(e))
             raise ClaudeProcessError(f"Claude SDK error: {str(e)}")
 
         except Exception as e:
-            # Handle ExceptionGroup from TaskGroup operations (Python 3.11+)
-            if type(e).__name__ == "ExceptionGroup" or hasattr(e, "exceptions"):
+            exceptions = getattr(e, "exceptions", None)
+            if exceptions is not None:
+                # ExceptionGroup from TaskGroup operations (Python 3.11+)
                 logger.error(
                     "Task group error in Claude SDK",
                     error=str(e),
                     error_type=type(e).__name__,
-                    exception_count=len(getattr(e, "exceptions", [])),
-                    exceptions=[
-                        str(ex) for ex in getattr(e, "exceptions", [])[:3]
-                    ],  # Log first 3 exceptions
+                    exception_count=len(exceptions),
+                    exceptions=[str(ex) for ex in exceptions[:3]],
                 )
-                # Extract the most relevant exception from the group
-                exceptions = getattr(e, "exceptions", [e])
-                main_exception = exceptions[0] if exceptions else e
                 raise ClaudeProcessError(
-                    f"Claude SDK task error: {str(main_exception)}"
+                    f"Claude SDK task error: {exceptions[0] if exceptions else e}"
                 )
 
-            # Check if it's an ExceptionGroup disguised as a regular exception
-            elif hasattr(e, "__notes__") and "TaskGroup" in str(e):
-                logger.error(
-                    "TaskGroup related error in Claude SDK",
-                    error=str(e),
-                    error_type=type(e).__name__,
-                )
-                raise ClaudeProcessError(f"Claude SDK task error: {str(e)}")
-
-            else:
-                logger.error(
-                    "Unexpected error in Claude SDK",
-                    error=str(e),
-                    error_type=type(e).__name__,
-                )
-                raise ClaudeProcessError(f"Unexpected error: {str(e)}")
-
-    async def _execute_query_with_streaming(
-        self, prompt: str, options, messages: List, stream_callback: Optional[Callable]
-    ) -> None:
-        """Execute query with streaming and collect messages."""
-        try:
-            async for message in query(prompt=prompt, options=options):
-                messages.append(message)
-
-                # Handle streaming callback
-                if stream_callback:
-                    try:
-                        await self._handle_stream_message(message, stream_callback)
-                    except Exception as callback_error:
-                        logger.warning(
-                            "Stream callback failed",
-                            error=str(callback_error),
-                            error_type=type(callback_error).__name__,
-                        )
-                        # Continue processing even if callback fails
-
-        except Exception as e:
-            # Handle both ExceptionGroups and regular exceptions
-            if type(e).__name__ == "ExceptionGroup" or hasattr(e, "exceptions"):
-                logger.error(
-                    "TaskGroup error in streaming execution",
-                    error=str(e),
-                    error_type=type(e).__name__,
-                )
-            else:
-                logger.error(
-                    "Error in streaming execution",
-                    error=str(e),
-                    error_type=type(e).__name__,
-                )
-            # Re-raise to be handled by the outer try-catch
-            raise
+            logger.error(
+                "Unexpected error in Claude SDK",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            raise ClaudeProcessError(f"Unexpected error: {str(e)}")
 
     async def _handle_stream_message(
         self, message: Message, stream_callback: Callable[[StreamUpdate], None]
     ) -> None:
-        """Handle streaming message from claude-code-sdk."""
+        """Handle streaming message from claude-agent-sdk."""
         try:
             if isinstance(message, AssistantMessage):
                 # Extract content from assistant message
                 content = getattr(message, "content", [])
+                text_parts = []
+                tool_calls = []
+
                 if content and isinstance(content, list):
-                    # Extract text from TextBlock objects
-                    text_parts = []
                     for block in content:
-                        if hasattr(block, "text"):
+                        if isinstance(block, ToolUseBlock):
+                            tool_calls.append(
+                                {
+                                    "name": block.name,
+                                    "input": block.input,
+                                    "id": block.id,
+                                }
+                            )
+                        elif isinstance(block, TextBlock):
                             text_parts.append(block.text)
-                    if text_parts:
-                        update = StreamUpdate(
-                            type="assistant",
-                            content="\n".join(text_parts),
-                        )
-                        await stream_callback(update)
+                        elif isinstance(block, ThinkingBlock):
+                            text_parts.append(block.thinking)
+
+                if text_parts or tool_calls:
+                    update = StreamUpdate(
+                        type="assistant",
+                        content=("\n".join(text_parts) if text_parts else None),
+                        tool_calls=tool_calls if tool_calls else None,
+                    )
+                    await stream_callback(update)
                 elif content:
                     # Fallback for non-list content
                     update = StreamUpdate(
@@ -361,8 +724,18 @@ class ClaudeSDKManager:
                     )
                     await stream_callback(update)
 
-                # Check for tool calls (if available in the message structure)
-                # Note: This depends on the actual claude-code-sdk message structure
+            elif isinstance(message, StreamEvent):
+                event = message.event or {}
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            update = StreamUpdate(
+                                type="stream_delta",
+                                content=text,
+                            )
+                            await stream_callback(update)
 
             elif isinstance(message, UserMessage):
                 content = getattr(message, "content", "")
@@ -376,64 +749,19 @@ class ClaudeSDKManager:
         except Exception as e:
             logger.warning("Stream callback failed", error=str(e))
 
-    def _extract_content_from_messages(self, messages: List[Message]) -> str:
-        """Extract content from message list."""
-        content_parts = []
+    def _load_mcp_config(self, config_path: Path) -> Dict[str, Any]:
+        """Load MCP server configuration from a JSON file.
 
-        for message in messages:
-            if isinstance(message, AssistantMessage):
-                content = getattr(message, "content", [])
-                if content and isinstance(content, list):
-                    # Extract text from TextBlock objects
-                    for block in content:
-                        if hasattr(block, "text"):
-                            content_parts.append(block.text)
-                elif content:
-                    # Fallback for non-list content
-                    content_parts.append(str(content))
+        The new claude-agent-sdk expects mcp_servers as a dict, not a file path.
+        """
+        import json
 
-        return "\n".join(content_parts)
-
-    def _extract_tools_from_messages(
-        self, messages: List[Message]
-    ) -> List[Dict[str, Any]]:
-        """Extract tools used from message list."""
-        tools_used = []
-        current_time = asyncio.get_event_loop().time()
-
-        for message in messages:
-            if isinstance(message, AssistantMessage):
-                content = getattr(message, "content", [])
-                if content and isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, ToolUseBlock):
-                            tools_used.append(
-                                {
-                                    "name": getattr(block, "tool_name", "unknown"),
-                                    "timestamp": current_time,
-                                    "input": getattr(block, "tool_input", {}),
-                                }
-                            )
-
-        return tools_used
-
-    def _update_session(self, session_id: str, messages: List[Message]) -> None:
-        """Update session data."""
-        if session_id not in self.active_sessions:
-            self.active_sessions[session_id] = {
-                "messages": [],
-                "created_at": asyncio.get_event_loop().time(),
-            }
-
-        session_data = self.active_sessions[session_id]
-        session_data["messages"] = messages
-        session_data["last_used"] = asyncio.get_event_loop().time()
-
-    async def kill_all_processes(self) -> None:
-        """Kill all active processes (no-op for SDK)."""
-        logger.info("Clearing active SDK sessions", count=len(self.active_sessions))
-        self.active_sessions.clear()
-
-    def get_active_process_count(self) -> int:
-        """Get number of active sessions."""
-        return len(self.active_sessions)
+        try:
+            with open(config_path) as f:
+                config_data = json.load(f)
+            return config_data.get("mcpServers", {})
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(
+                "Failed to load MCP config", path=str(config_path), error=str(e)
+            )
+            return {}

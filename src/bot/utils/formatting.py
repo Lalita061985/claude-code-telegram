@@ -2,11 +2,12 @@
 
 import re
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ...config.settings import Settings
+from .html_format import escape_html, markdown_to_telegram_html
 
 
 @dataclass
@@ -14,7 +15,7 @@ class FormattedMessage:
     """Represents a formatted message for Telegram."""
 
     text: str
-    parse_mode: str = "Markdown"
+    parse_mode: str = "HTML"
     reply_markup: Optional[InlineKeyboardMarkup] = None
 
     def __len__(self) -> int:
@@ -29,7 +30,9 @@ class ResponseFormatter:
         """Initialize formatter with settings."""
         self.settings = settings
         self.max_message_length = 4000  # Telegram limit is 4096, leave some buffer
-        self.max_code_block_length = 3000  # Max length for code blocks
+        self.max_code_block_length = (
+            15000  # Max length for individual code blocks before splitting
+        )
 
     def format_claude_response(
         self, text: str, context: Optional[dict] = None
@@ -55,7 +58,14 @@ class ResponseFormatter:
         if messages and self.settings.enable_quick_actions:
             messages[-1].reply_markup = self._get_contextual_keyboard(context)
 
-        return messages if messages else [FormattedMessage("_(No content to display)_")]
+        # Filter out any empty messages produced by formatting/splitting
+        messages = [m for m in messages if m.text and m.text.strip()]
+
+        return (
+            messages
+            if messages
+            else [FormattedMessage("<i>(No content to display)</i>")]
+        )
 
     def _should_use_semantic_chunking(self, text: str) -> bool:
         """Determine if semantic chunking is needed."""
@@ -91,43 +101,50 @@ class ResponseFormatter:
             "Rate Limit": "⏱️",
         }.get(error_type, "❌")
 
-        text = f"{icon} **{error_type}**\n\n{error}"
+        text = f"{icon} <b>{escape_html(error_type)}</b>\n\n{escape_html(error)}"
 
-        return FormattedMessage(text, parse_mode="Markdown")
+        return FormattedMessage(text, parse_mode="HTML")
 
     def format_success_message(
         self, message: str, title: str = "Success"
     ) -> FormattedMessage:
         """Format success message with appropriate styling."""
-        text = f"✅ **{title}**\n\n{message}"
-        return FormattedMessage(text, parse_mode="Markdown")
+        text = f"✅ <b>{escape_html(title)}</b>\n\n{escape_html(message)}"
+        return FormattedMessage(text, parse_mode="HTML")
 
     def format_info_message(
         self, message: str, title: str = "Info"
     ) -> FormattedMessage:
         """Format info message with appropriate styling."""
-        text = f"ℹ️ **{title}**\n\n{message}"
-        return FormattedMessage(text, parse_mode="Markdown")
+        text = f"ℹ️ <b>{escape_html(title)}</b>\n\n{escape_html(message)}"
+        return FormattedMessage(text, parse_mode="HTML")
 
     def format_code_output(
         self, output: str, language: str = "", title: str = "Output"
     ) -> List[FormattedMessage]:
         """Format code output with syntax highlighting."""
         if not output.strip():
-            return [FormattedMessage(f"📄 **{title}**\n\n_(empty output)_")]
+            return [
+                FormattedMessage(
+                    f"📄 <b>{escape_html(title)}</b>\n\n<i>(empty output)</i>"
+                )
+            ]
 
-        # Add language hint if provided
-        code_block = (
-            f"```{language}\n{output}\n```" if language else f"```\n{output}\n```"
-        )
+        escaped_output = escape_html(output)
 
         # Check if the code block is too long
-        if len(code_block) > self.max_code_block_length:
-            # Truncate and add notice
-            truncated = output[: self.max_code_block_length - 100]
-            code_block = f"```{language}\n{truncated}\n... (output truncated)\n```"
+        if len(escaped_output) > self.max_code_block_length:
+            escaped_output = (
+                escape_html(output[: self.max_code_block_length - 100])
+                + "\n... (output truncated)"
+            )
 
-        text = f"📄 **{title}**\n\n{code_block}"
+        if language:
+            code_block = f'<pre><code class="language-{escape_html(language)}">{escaped_output}</code></pre>'
+        else:
+            code_block = f"<pre><code>{escaped_output}</code></pre>"
+
+        text = f"📄 <b>{escape_html(title)}</b>\n\n{code_block}"
 
         return self._split_message(text)
 
@@ -135,38 +152,41 @@ class ResponseFormatter:
         self, files: List[str], directory: str = ""
     ) -> FormattedMessage:
         """Format file listing with appropriate icons."""
+        safe_dir = escape_html(directory)
         if not files:
-            text = f"📂 **{directory}**\n\n_(empty directory)_"
+            text = f"📂 <b>{safe_dir}</b>\n\n<i>(empty directory)</i>"
         else:
             file_lines = []
             for file in files[:50]:  # Limit to 50 items
+                safe_file = escape_html(file)
                 if file.endswith("/"):
-                    file_lines.append(f"📁 {file}")
+                    file_lines.append(f"📁 {safe_file}")
                 else:
-                    file_lines.append(f"📄 {file}")
+                    file_lines.append(f"📄 {safe_file}")
 
             file_text = "\n".join(file_lines)
             if len(files) > 50:
-                file_text += f"\n\n_... and {len(files) - 50} more items_"
+                file_text += f"\n\n<i>... and {len(files) - 50} more items</i>"
 
-            text = f"📂 **{directory}**\n\n{file_text}"
+            text = f"📂 <b>{safe_dir}</b>\n\n{file_text}"
 
-        return FormattedMessage(text, parse_mode="Markdown")
+        return FormattedMessage(text, parse_mode="HTML")
 
     def format_progress_message(
         self, message: str, percentage: Optional[float] = None
     ) -> FormattedMessage:
         """Format progress message with optional progress bar."""
+        safe_msg = escape_html(message)
         if percentage is not None:
             # Create simple progress bar
             filled = int(percentage / 10)
             empty = 10 - filled
             progress_bar = "▓" * filled + "░" * empty
-            text = f"🔄 **{message}**\n\n{progress_bar} {percentage:.0f}%"
+            text = f"🔄 <b>{safe_msg}</b>\n\n{progress_bar} {percentage:.0f}%"
         else:
-            text = f"🔄 **{message}**"
+            text = f"🔄 <b>{safe_msg}</b>"
 
-        return FormattedMessage(text, parse_mode="Markdown")
+        return FormattedMessage(text, parse_mode="HTML")
 
     def _semantic_chunk(self, text: str, context: Optional[dict]) -> List[dict]:
         """Split text into semantic chunks based on content type."""
@@ -196,7 +216,6 @@ class ResponseFormatter:
         lines = text.split("\n")
         current_section = {"type": "text", "content": "", "start_line": 0}
         in_code_block = False
-        code_start = 0
 
         for i, line in enumerate(lines):
             # Check for code block markers
@@ -206,7 +225,6 @@ class ResponseFormatter:
                     if current_section["content"].strip():
                         sections.append(current_section)
                     in_code_block = True
-                    code_start = i
                     current_section = {
                         "type": "code_block",
                         "content": line + "\n",
@@ -367,25 +385,22 @@ class ResponseFormatter:
             # Format code blocks with proper styling
             if chunk.get("format") == "split":
                 title = (
-                    "📄 **Code (continued)**"
+                    "📄 <b>Code (continued)</b>"
                     if "continued" in content
-                    else "📄 **Code**"
+                    else "📄 <b>Code</b>"
                 )
             else:
-                title = "📄 **Code**"
+                title = "📄 <b>Code</b>"
 
             text = f"{title}\n\n{content}"
 
         elif chunk_type == "file_operations":
-            # Format file operations with icons
-            text = f"📁 **File Operations**\n\n{content}"
+            text = f"📁 <b>File Operations</b>\n\n{content}"
 
         elif chunk_type == "explanation":
-            # Regular explanation text
             text = content
 
         else:
-            # Default text formatting
             text = content
 
         # Split if still too long
@@ -428,67 +443,45 @@ class ResponseFormatter:
         # Remove excessive whitespace
         text = re.sub(r"\n{3,}", "\n\n", text)
 
-        # Escape special Markdown characters (but preserve intentional formatting)
-        # Be careful not to escape characters inside code blocks
-        text = self._escape_markdown_outside_code(text)
+        # Convert markdown to Telegram HTML
+        text = markdown_to_telegram_html(text)
 
         return text.strip()
 
-    def _escape_markdown_outside_code(self, text: str) -> str:
-        """Escape Markdown characters outside of code blocks."""
-        # This is a simplified approach - in practice, you might want more sophisticated parsing
-        parts = []
-        in_code_block = False
-        in_inline_code = False
-
-        lines = text.split("\n")
-        for line in lines:
-            if line.strip() == "```":
-                in_code_block = not in_code_block
-                parts.append(line)
-            elif in_code_block:
-                parts.append(line)
-            else:
-                # Handle inline code
-                line_parts = line.split("`")
-                for i, part in enumerate(line_parts):
-                    if i % 2 == 0:  # Outside inline code
-                        # Escape special characters
-                        part = part.replace("_", r"\_").replace("*", r"\*")
-                    line_parts[i] = part
-                parts.append("`".join(line_parts))
-
-        return "\n".join(parts)
-
     def _format_code_blocks(self, text: str) -> str:
-        """Ensure code blocks are properly formatted for Telegram."""
-        # Handle triple backticks with language specification
-        pattern = r"```(\w+)?\n(.*?)```"
+        """Ensure code blocks are properly formatted for Telegram.
 
-        def replace_code_block(match):
-            lang = match.group(1) or ""
-            code = match.group(2)
+        With HTML mode, markdown_to_telegram_html already handles code blocks.
+        This method now just truncates oversized code blocks.
+        """
 
-            # Telegram doesn't support language hints, but we can add them as comments
-            if lang and lang.lower() not in ["text", "plain"]:
-                # Add language as a comment at the top
-                code = f"# {lang}\n{code}"
+        def _truncate_code(m: re.Match) -> str:  # type: ignore[type-arg]
+            full = m.group(0)
+            if len(full) > self.max_code_block_length:
+                # Re-extract and truncate the inner content
+                inner = m.group(1)
+                truncated = inner[: self.max_code_block_length - 80]
+                return (
+                    f"<pre><code>{escape_html(truncated)}\n... (truncated)</code></pre>"
+                )
+            return full
 
-            # Ensure code block doesn't exceed length limits
-            if len(code) > self.max_code_block_length:
-                code = code[: self.max_code_block_length - 50] + "\n... (truncated)"
-
-            return f"```\n{code}\n```"
-
-        return re.sub(pattern, replace_code_block, text, flags=re.DOTALL)
+        return re.sub(
+            r"<pre><code[^>]*>(.*?)</code></pre>",
+            _truncate_code,
+            text,
+            flags=re.DOTALL,
+        )
 
     def _split_message(self, text: str) -> List[FormattedMessage]:
         """Split long messages while preserving formatting."""
+        if not text or not text.strip():
+            return []
         if len(text) <= self.max_message_length:
             return [FormattedMessage(text)]
 
         messages = []
-        current_lines = []
+        current_lines: List[str] = []
         current_length = 0
         in_code_block = False
 
@@ -497,13 +490,14 @@ class ResponseFormatter:
         for line in lines:
             line_length = len(line) + 1  # +1 for newline
 
-            # Check for code block markers
-            if line.strip() == "```":
-                in_code_block = not in_code_block
+            # Track HTML <pre> code block state
+            if "<pre>" in line or "<pre><code" in line:
+                in_code_block = True
+            if "</pre>" in line:
+                in_code_block = False
 
             # If this is a very long line that exceeds limit by itself, split it
             if line_length > self.max_message_length:
-                # Split the line into chunks
                 chunks = []
                 for i in range(0, len(line), self.max_message_length - 100):
                     chunks.append(line[i : i + self.max_message_length - 100])
@@ -515,17 +509,15 @@ class ResponseFormatter:
                         current_length + chunk_length > self.max_message_length
                         and current_lines
                     ):
-                        # Save current message
                         if in_code_block:
-                            current_lines.append("```")
+                            current_lines.append("</code></pre>")
                         messages.append(FormattedMessage("\n".join(current_lines)))
 
-                        # Start new message
                         current_lines = []
                         current_length = 0
                         if in_code_block:
-                            current_lines.append("```")
-                            current_length = 4
+                            current_lines.append("<pre><code>")
+                            current_length = 12
 
                     current_lines.append(chunk)
                     current_length += chunk_length
@@ -533,30 +525,23 @@ class ResponseFormatter:
 
             # Check if adding this line would exceed the limit
             if current_length + line_length > self.max_message_length and current_lines:
-                # Close code block if we're in one
                 if in_code_block:
-                    current_lines.append("```")
+                    current_lines.append("</code></pre>")
 
-                # Save current message
                 messages.append(FormattedMessage("\n".join(current_lines)))
 
-                # Start new message
                 current_lines = []
                 current_length = 0
 
-                # Reopen code block if needed
                 if in_code_block:
-                    current_lines.append("```")
-                    current_length = 4  # Length of '```\n'
+                    current_lines.append("<pre><code>")
+                    current_length = 12
 
             current_lines.append(line)
             current_length += line_length
 
         # Add remaining content
         if current_lines:
-            # Close code block if needed
-            if in_code_block:
-                current_lines.append("```")
             messages.append(FormattedMessage("\n".join(current_lines)))
 
         return messages
@@ -688,11 +673,12 @@ class CodeHighlighter:
 
     @classmethod
     def format_code(cls, code: str, language: str = "", filename: str = "") -> str:
-        """Format code with language detection."""
+        """Format code with language detection, using HTML tags."""
         if not language and filename:
             language = cls.detect_language(filename)
 
+        escaped_code = escape_html(code)
         if language:
-            return f"```{language}\n{code}\n```"
+            return f'<pre><code class="language-{escape_html(language)}">{escaped_code}</code></pre>'
         else:
-            return f"```\n{code}\n```"
+            return f"<pre><code>{escaped_code}</code></pre>"

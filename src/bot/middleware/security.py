@@ -4,6 +4,8 @@ from typing import Any, Callable, Dict
 
 import structlog
 
+from ..utils.html_format import escape_html
+
 logger = structlog.get_logger()
 
 
@@ -38,18 +40,24 @@ async def security_middleware(
         # Continue without validation (log error but don't block)
         return await handler(event, data)
 
-    # Validate text content if present
+    # In agentic mode, user text is a prompt to Claude — not a command.
+    # Skip input validation so natural conversation (backticks, paths, etc.) works.
+    settings = data.get("settings")
+    agentic_mode = getattr(settings, "agentic_mode", False) if settings else False
+
+    # Validate text content if present (classic mode only)
     message = event.effective_message
-    if message and message.text:
+    if message and message.text and not agentic_mode:
         is_safe, violation_type = await validate_message_content(
             message.text, security_validator, user_id, audit_logger
         )
         if not is_safe:
             await message.reply_text(
-                f"🛡️ **Security Alert**\n\n"
+                f"🛡️ <b>Security Alert</b>\n\n"
                 f"Your message contains potentially dangerous content and has been blocked.\n"
-                f"Violation: {violation_type}\n\n"
-                "If you believe this is an error, please contact the administrator."
+                f"Violation: {escape_html(violation_type)}\n\n"
+                "If you believe this is an error, please contact the administrator.",
+                parse_mode="HTML",
             )
             return  # Block processing
 
@@ -60,9 +68,10 @@ async def security_middleware(
         )
         if not is_safe:
             await message.reply_text(
-                f"🛡️ **File Upload Blocked**\n\n"
-                f"{error_message}\n\n"
-                "Please ensure your file meets security requirements."
+                f"🛡️ <b>File Upload Blocked</b>\n\n"
+                f"{escape_html(error_message)}\n\n"
+                "Please ensure your file meets security requirements.",
+                parse_mode="HTML",
             )
             return  # Block processing
 
@@ -382,10 +391,11 @@ async def threat_detection_middleware(
 
             if event.effective_message:
                 await event.effective_message.reply_text(
-                    "🔍 **Suspicious Activity Detected**\n\n"
+                    "🔍 <b>Suspicious Activity Detected</b>\n\n"
                     "Multiple reconnaissance-style commands detected. "
                     "This activity has been logged.\n\n"
-                    "If you have legitimate needs, please contact the administrator."
+                    "If you have legitimate needs, please contact the administrator.",
+                    parse_mode="HTML",
                 )
 
     return await handler(event, data)

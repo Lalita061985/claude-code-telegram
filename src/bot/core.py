@@ -11,12 +11,12 @@ import asyncio
 from typing import Any, Callable, Dict, Optional
 
 import structlog
-from telegram import BotCommand, Update
+from telegram import Update
 from telegram.ext import (
+    AIORateLimiter,
     Application,
-    CallbackQueryHandler,
-    CommandHandler,
     ContextTypes,
+    Defaults,
     MessageHandler,
     filters,
 )
@@ -24,6 +24,7 @@ from telegram.ext import (
 from ..config.settings import Settings
 from ..exceptions import ClaudeCodeTelegramError
 from .features.registry import FeatureRegistry
+from .orchestrator import MessageOrchestrator
 
 logger = structlog.get_logger()
 
@@ -38,20 +39,42 @@ class ClaudeCodeBot:
         self.app: Optional[Application] = None
         self.is_running = False
         self.feature_registry: Optional[FeatureRegistry] = None
+        self.orchestrator = MessageOrchestrator(settings, dependencies)
 
     async def initialize(self) -> None:
-        """Initialize bot application."""
+        """Initialize bot application. Idempotent — safe to call multiple times."""
+        if self.app is not None:
+            return
+
         logger.info("Initializing Telegram bot")
 
         # Create application
         builder = Application.builder()
         builder.token(self.settings.telegram_token_str)
+        builder.defaults(Defaults(do_quote=self.settings.reply_quote))
+        builder.rate_limiter(AIORateLimiter(max_retries=1))
+
+        from .update_processor import StopAwareUpdateProcessor
+
+        builder.concurrent_updates(StopAwareUpdateProcessor())
 
         # Configure connection settings
         builder.connect_timeout(30)
         builder.read_timeout(30)
         builder.write_timeout(30)
         builder.pool_timeout(30)
+
+        # Explicitly set proxy from environment variables.
+        # This is necessary because python-telegram-bot's Application.builder()
+        # does not automatically use HTTP_PROXY/HTTPS_PROXY environment variables.
+        # Without this, the httpx connection pool can become corrupted when running
+        # behind a proxy, causing the bot to stop responding to messages.
+        import os
+
+        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        if proxy_url:
+            builder.proxy(proxy_url)
+            logger.info("Proxy configured", proxy=proxy_url)
 
         self.app = builder.build()
 
@@ -65,7 +88,11 @@ class ClaudeCodeBot:
         # Add feature registry to dependencies
         self.deps["features"] = self.feature_registry
 
-        # Set bot commands for menu
+        # Initialize the underlying Telegram Application so the bot's
+        # HTTP client is ready before we make API calls.
+        await self.app.initialize()
+
+        # Set bot commands for menu (requires initialized HTTP client)
         await self._set_bot_commands()
 
         # Register handlers
@@ -80,91 +107,14 @@ class ClaudeCodeBot:
         logger.info("Bot initialization complete")
 
     async def _set_bot_commands(self) -> None:
-        """Set bot command menu."""
-        commands = [
-            BotCommand("start", "Start bot and show help"),
-            BotCommand("help", "Show available commands"),
-            BotCommand("new", "Start new Claude session"),
-            BotCommand("continue", "Continue last session"),
-            BotCommand("ls", "List files in current directory"),
-            BotCommand("cd", "Change directory"),
-            BotCommand("pwd", "Show current directory"),
-            BotCommand("projects", "Show all projects"),
-            BotCommand("status", "Show session status"),
-            BotCommand("export", "Export current session"),
-            BotCommand("actions", "Show quick actions"),
-            BotCommand("git", "Git repository commands"),
-        ]
-
+        """Set bot command menu via orchestrator."""
+        commands = await self.orchestrator.get_bot_commands()
         await self.app.bot.set_my_commands(commands)
         logger.info("Bot commands set", commands=[cmd.command for cmd in commands])
 
     def _register_handlers(self) -> None:
-        """Register all command and message handlers."""
-        from .handlers import callback, command, message
-
-        # Command handlers
-        handlers = [
-            ("start", command.start_command),
-            ("help", command.help_command),
-            ("new", command.new_session),
-            ("continue", command.continue_session),
-            ("end", command.end_session),
-            ("ls", command.list_files),
-            ("cd", command.change_directory),
-            ("pwd", command.print_working_directory),
-            ("projects", command.show_projects),
-            ("status", command.session_status),
-            ("export", command.export_session),
-            ("actions", command.quick_actions),
-            ("git", command.git_command),
-        ]
-
-        for cmd, handler in handlers:
-            self.app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
-
-        # Message handlers with priority groups
-        self.app.add_handler(
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                self._inject_deps(message.handle_text_message),
-            ),
-            group=10,
-        )
-
-        self.app.add_handler(
-            MessageHandler(
-                filters.Document.ALL, self._inject_deps(message.handle_document)
-            ),
-            group=10,
-        )
-
-        self.app.add_handler(
-            MessageHandler(filters.PHOTO, self._inject_deps(message.handle_photo)),
-            group=10,
-        )
-
-        # Callback query handler
-        self.app.add_handler(
-            CallbackQueryHandler(self._inject_deps(callback.handle_callback_query))
-        )
-
-        logger.info("Bot handlers registered")
-
-    def _inject_deps(self, handler: Callable) -> Callable:
-        """Inject dependencies into handlers."""
-
-        async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            # Add dependencies to context
-            for key, value in self.deps.items():
-                context.bot_data[key] = value
-
-            # Add settings
-            context.bot_data["settings"] = self.settings
-
-            return await handler(update, context)
-
-        return wrapped
+        """Register handlers via orchestrator (mode-aware)."""
+        self.orchestrator.register_handlers(self.app)
 
     def _add_middleware(self) -> None:
         """Add middleware to application."""
@@ -200,22 +150,49 @@ class ClaudeCodeBot:
         logger.info("Middleware added to bot")
 
     def _create_middleware_handler(self, middleware_func: Callable) -> Callable:
-        """Create middleware handler that injects dependencies."""
+        """Create middleware handler that injects dependencies.
+
+        When middleware rejects a request (returns without calling the handler),
+        ApplicationHandlerStop is raised to prevent subsequent handler groups
+        from processing the update.
+        """
+        from telegram.ext import ApplicationHandlerStop
 
         async def middleware_wrapper(
             update: Update, context: ContextTypes.DEFAULT_TYPE
-        ):
+        ) -> None:
+            # Ignore updates generated by bots (including this bot) to avoid
+            # self-authentication loops and duplicate processing.
+            if update.effective_user and getattr(
+                update.effective_user, "is_bot", False
+            ):
+                logger.debug(
+                    "Skipping bot-originated update in middleware",
+                    user_id=update.effective_user.id,
+                    middleware=middleware_func.__name__,
+                )
+                raise ApplicationHandlerStop
+
             # Inject dependencies into context
             for key, value in self.deps.items():
                 context.bot_data[key] = value
             context.bot_data["settings"] = self.settings
 
-            # Create a dummy handler that does nothing (middleware will handle everything)
-            async def dummy_handler(event, data):
-                return None
+            # Track whether the middleware allowed the request through
+            handler_called = False
+
+            async def dummy_handler(event: Any, data: Any) -> None:
+                nonlocal handler_called
+                handler_called = True
 
             # Call middleware with Telegram-style parameters
-            return await middleware_func(dummy_handler, update, context.bot_data)
+            await middleware_func(dummy_handler, update, context.bot_data)
+
+            # If middleware didn't call the handler, it rejected the request.
+            # Raise ApplicationHandlerStop to prevent subsequent handler groups
+            # (including the main message handlers) from processing this update.
+            if not handler_called:
+                raise ApplicationHandlerStop()
 
         return middleware_wrapper
 

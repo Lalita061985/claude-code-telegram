@@ -3,16 +3,14 @@
 Provides simple interface for bot handlers.
 """
 
+import asyncio
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import structlog
 
 from ..config.settings import Settings
-from .exceptions import ClaudeToolValidationError
-from .integration import ClaudeProcessManager, ClaudeResponse, StreamUpdate
-from .monitor import ToolMonitor
-from .sdk_integration import ClaudeSDKManager
+from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from .session import SessionManager
 
 logger = structlog.get_logger()
@@ -24,29 +22,13 @@ class ClaudeIntegration:
     def __init__(
         self,
         config: Settings,
-        process_manager: Optional[ClaudeProcessManager] = None,
         sdk_manager: Optional[ClaudeSDKManager] = None,
         session_manager: Optional[SessionManager] = None,
-        tool_monitor: Optional[ToolMonitor] = None,
     ):
         """Initialize Claude integration facade."""
         self.config = config
-
-        # Initialize both managers for fallback capability
-        self.sdk_manager = (
-            sdk_manager or ClaudeSDKManager(config) if config.use_sdk else None
-        )
-        self.process_manager = process_manager or ClaudeProcessManager(config)
-
-        # Use SDK by default if configured
-        if config.use_sdk:
-            self.manager = self.sdk_manager
-        else:
-            self.manager = self.process_manager
-
+        self.sdk_manager = sdk_manager or ClaudeSDKManager(config)
         self.session_manager = session_manager
-        self.tool_monitor = tool_monitor
-        self._sdk_failed_count = 0  # Track SDK failures for adaptive fallback
 
     async def run_command(
         self,
@@ -55,6 +37,9 @@ class ClaudeIntegration:
         user_id: int,
         session_id: Optional[str] = None,
         on_stream: Optional[Callable[[StreamUpdate], None]] = None,
+        force_new: bool = False,
+        interrupt_event: Optional["asyncio.Event"] = None,
+        images: Optional[List[Dict[str, str]]] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         logger.info(
@@ -63,146 +48,89 @@ class ClaudeIntegration:
             working_directory=str(working_directory),
             session_id=session_id,
             prompt_length=len(prompt),
+            force_new=force_new,
         )
+
+        # If no session_id provided, try to find an existing session for this
+        # user+directory combination (auto-resume).
+        # Skip auto-resume when force_new is set (e.g. after /new command).
+        if not session_id and not force_new:
+            existing_session = await self._find_resumable_session(
+                user_id, working_directory
+            )
+            if existing_session:
+                session_id = existing_session.session_id
+                logger.info(
+                    "Auto-resuming existing session for project",
+                    session_id=session_id,
+                    project_path=str(working_directory),
+                    user_id=user_id,
+                )
 
         # Get or create session
         session = await self.session_manager.get_or_create_session(
             user_id, working_directory, session_id
         )
 
-        # Track streaming updates and validate tool calls
-        tools_validated = True
-        validation_errors = []
-        blocked_tools = set()
-
-        async def stream_handler(update: StreamUpdate):
-            nonlocal tools_validated
-
-            # Validate tool calls
-            if update.tool_calls:
-                for tool_call in update.tool_calls:
-                    tool_name = tool_call["name"]
-                    valid, error = await self.tool_monitor.validate_tool_call(
-                        tool_name,
-                        tool_call.get("input", {}),
-                        working_directory,
-                        user_id,
-                    )
-
-                    if not valid:
-                        tools_validated = False
-                        validation_errors.append(error)
-
-                        # Track blocked tools
-                        if "Tool not allowed:" in error:
-                            blocked_tools.add(tool_name)
-
-                        logger.error(
-                            "Tool validation failed",
-                            tool_name=tool_name,
-                            error=error,
-                            user_id=user_id,
-                        )
-
-                        # For critical tools, we should fail fast
-                        if tool_name in ["Task", "Read", "Write", "Edit"]:
-                            # Create comprehensive error message
-                            admin_instructions = self._get_admin_instructions(
-                                list(blocked_tools)
-                            )
-                            error_msg = self._create_tool_error_message(
-                                list(blocked_tools),
-                                self.config.claude_allowed_tools or [],
-                                admin_instructions,
-                            )
-
-                            raise ClaudeToolValidationError(
-                                error_msg,
-                                blocked_tools=list(blocked_tools),
-                                allowed_tools=self.config.claude_allowed_tools or [],
-                            )
-
-            # Pass to caller's handler
-            if on_stream:
-                try:
-                    await on_stream(update)
-                except Exception as e:
-                    logger.warning("Stream callback failed", error=str(e))
-
         # Execute command
         try:
-            # Only continue session if it's not a new session
-            should_continue = bool(session_id) and not getattr(
-                session, "is_new_session", False
-            )
+            # Continue session if we have an existing session with a real ID
+            is_new = getattr(session, "is_new_session", False)
+            should_continue = not is_new and bool(session.session_id)
 
-            # For new sessions, don't pass the temporary session_id to Claude Code
-            claude_session_id = (
-                None
-                if getattr(session, "is_new_session", False)
-                else session.session_id
-            )
+            # For new sessions, don't pass session_id to Claude Code
+            claude_session_id = session.session_id if should_continue else None
 
-            response = await self._execute_with_fallback(
-                prompt=prompt,
-                working_directory=working_directory,
-                session_id=claude_session_id,
-                continue_session=should_continue,
-                stream_callback=stream_handler,
-            )
-
-            # Check if tool validation failed
-            if not tools_validated:
-                logger.error(
-                    "Command completed but tool validation failed",
-                    validation_errors=validation_errors,
+            try:
+                response = await self._execute(
+                    prompt=prompt,
+                    working_directory=working_directory,
+                    session_id=claude_session_id,
+                    continue_session=should_continue,
+                    stream_callback=on_stream,
+                    interrupt_event=interrupt_event,
+                    images=images,
                 )
-                # Mark response as having errors and include validation details
-                response.is_error = True
-                response.error_type = "tool_validation_failed"
+            except Exception as resume_error:
+                # If resume failed (e.g., session expired/missing on Claude's side),
+                # retry as a fresh session.  The CLI returns a generic exit-code-1
+                # when the session is gone, so we catch *any* error during resume.
+                if should_continue:
+                    logger.warning(
+                        "Session resume failed, starting fresh session",
+                        failed_session_id=claude_session_id,
+                        error=str(resume_error),
+                    )
+                    # Clean up the stale session
+                    await self.session_manager.remove_session(session.session_id)
 
-                # Extract blocked tool names for user feedback
-                blocked_tools = []
-                for error in validation_errors:
-                    if "Tool not allowed:" in error:
-                        tool_name = error.split("Tool not allowed: ")[1]
-                        blocked_tools.append(tool_name)
-
-                # Create user-friendly error message
-                if blocked_tools:
-                    tool_list = ", ".join(f"`{tool}`" for tool in blocked_tools)
-                    response.content = (
-                        f"🚫 **Tool Access Blocked**\n\n"
-                        f"Claude tried to use tools not allowed:\n"
-                        f"{tool_list}\n\n"
-                        f"**What you can do:**\n"
-                        f"• Contact the administrator to request access to these tools\n"
-                        f"• Try rephrasing your request to use different approaches\n"
-                        f"• Check what tools are currently available with `/status`\n\n"
-                        f"**Currently allowed tools:**\n"
-                        f"{', '.join(f'`{t}`' for t in self.config.claude_allowed_tools or [])}"
+                    # Create a fresh session and retry
+                    session = await self.session_manager.get_or_create_session(
+                        user_id, working_directory
+                    )
+                    response = await self._execute(
+                        prompt=prompt,
+                        working_directory=working_directory,
+                        session_id=None,
+                        continue_session=False,
+                        stream_callback=on_stream,
+                        interrupt_event=interrupt_event,
+                        images=images,
                     )
                 else:
-                    response.content = (
-                        f"🚫 **Tool Validation Failed**\n\n"
-                        f"Tools failed security validation. Try different approach.\n\n"
-                        f"Details: {'; '.join(validation_errors)}"
-                    )
+                    raise
 
-            # Update session (this may change the session_id for new sessions)
-            old_session_id = session.session_id
-            await self.session_manager.update_session(session.session_id, response)
+            # Update session (assigns real session_id for new sessions)
+            await self.session_manager.update_session(session, response)
 
-            # For new sessions, get the updated session_id from the session manager
-            if hasattr(session, "is_new_session") and response.session_id:
-                # The session_id has been updated to Claude's session_id
-                final_session_id = response.session_id
-            else:
-                # Use the original session_id for continuing sessions
-                final_session_id = old_session_id
+            # Ensure response has the session's final ID
+            response.session_id = session.session_id
 
-            # Ensure response has the correct session_id
-            response.session_id = final_session_id
+            if not response.session_id:
+                logger.warning(
+                    "No session_id after execution; session cannot be resumed",
+                    user_id=user_id,
+                )
 
             logger.info(
                 "Claude command completed",
@@ -224,84 +152,52 @@ class ClaudeIntegration:
             )
             raise
 
-    async def _execute_with_fallback(
+    async def _execute(
         self,
         prompt: str,
         working_directory: Path,
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
+        images: Optional[List[Dict[str, str]]] = None,
     ) -> ClaudeResponse:
-        """Execute command with SDK->subprocess fallback on JSON decode errors."""
-        # Try SDK first if configured
-        if self.config.use_sdk and self.sdk_manager:
-            try:
-                logger.debug("Attempting Claude SDK execution")
-                response = await self.sdk_manager.execute_command(
-                    prompt=prompt,
-                    working_directory=working_directory,
-                    session_id=session_id,
-                    continue_session=continue_session,
-                    stream_callback=stream_callback,
-                )
-                # Reset failure count on success
-                self._sdk_failed_count = 0
-                return response
+        """Execute command via SDK."""
+        return await self.sdk_manager.execute_command(
+            prompt=prompt,
+            working_directory=working_directory,
+            session_id=session_id,
+            continue_session=continue_session,
+            stream_callback=stream_callback,
+            interrupt_event=interrupt_event,
+            images=images,
+        )
 
-            except Exception as e:
-                error_str = str(e)
-                # Check if this is a JSON decode error that indicates SDK issues
-                if (
-                    "Failed to decode JSON" in error_str
-                    or "JSON decode error" in error_str
-                    or "TaskGroup" in error_str
-                    or "ExceptionGroup" in error_str
-                ):
-                    self._sdk_failed_count += 1
-                    logger.warning(
-                        "Claude SDK failed with JSON/TaskGroup error, falling back to subprocess",
-                        error=error_str,
-                        failure_count=self._sdk_failed_count,
-                        error_type=type(e).__name__,
-                    )
+    async def _find_resumable_session(
+        self,
+        user_id: int,
+        working_directory: Path,
+    ) -> Optional["ClaudeSession"]:  # noqa: F821
+        """Find the most recent resumable session for a user in a directory.
 
-                    # Use subprocess fallback
-                    try:
-                        logger.info("Executing with subprocess fallback")
-                        response = await self.process_manager.execute_command(
-                            prompt=prompt,
-                            working_directory=working_directory,
-                            session_id=session_id,
-                            continue_session=continue_session,
-                            stream_callback=stream_callback,
-                        )
-                        logger.info("Subprocess fallback succeeded")
-                        return response
+        Returns the session if one exists that is non-expired and has a real
+        (non-temporary) session ID from Claude. Returns None otherwise.
+        """
 
-                    except Exception as fallback_error:
-                        logger.error(
-                            "Both SDK and subprocess failed",
-                            sdk_error=error_str,
-                            subprocess_error=str(fallback_error),
-                        )
-                        # Re-raise the original SDK error since it was the primary method
-                        raise e
-                else:
-                    # For non-JSON errors, re-raise immediately
-                    logger.error(
-                        "Claude SDK failed with non-JSON error", error=error_str
-                    )
-                    raise
-        else:
-            # Use subprocess directly if SDK not configured
-            logger.debug("Using subprocess execution (SDK disabled)")
-            return await self.process_manager.execute_command(
-                prompt=prompt,
-                working_directory=working_directory,
-                session_id=session_id,
-                continue_session=continue_session,
-                stream_callback=stream_callback,
-            )
+        sessions = await self.session_manager._get_user_sessions(user_id)
+
+        matching_sessions = [
+            s
+            for s in sessions
+            if s.project_path == working_directory
+            and bool(s.session_id)
+            and not s.is_expired(self.config.session_timeout_hours)
+        ]
+
+        if not matching_sessions:
+            return None
+
+        return max(matching_sessions, key=lambda s: s.last_used)
 
     async def continue_session(
         self,
@@ -321,12 +217,11 @@ class ClaudeIntegration:
         # Get user's sessions
         sessions = await self.session_manager._get_user_sessions(user_id)
 
-        # Find most recent session in this directory (exclude temporary sessions)
+        # Find most recent session in this directory (exclude sessions without IDs)
         matching_sessions = [
             s
             for s in sessions
-            if s.project_path == working_directory
-            and not s.session_id.startswith("temp_")
+            if s.project_path == working_directory and bool(s.session_id)
         ]
 
         if not matching_sessions:
@@ -336,18 +231,21 @@ class ClaudeIntegration:
         # Get most recent
         latest_session = max(matching_sessions, key=lambda s: s.last_used)
 
-        # Continue session
+        # Continue session with default prompt if none provided
+        # Claude CLI requires a prompt, so we use a placeholder
         return await self.run_command(
-            prompt=prompt or "",
+            prompt=prompt or "Please continue where we left off",
             working_directory=working_directory,
             user_id=user_id,
             session_id=latest_session.session_id,
             on_stream=on_stream,
         )
 
-    async def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get session information."""
-        return await self.session_manager.get_session_info(session_id)
+    async def get_session_info(
+        self, session_id: str, user_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Get session information (scoped to requesting user)."""
+        return await self.session_manager.get_session_info(session_id, user_id)
 
     async def get_user_sessions(self, user_id: int) -> List[Dict[str, Any]]:
         """Get all sessions for a user."""
@@ -370,128 +268,19 @@ class ClaudeIntegration:
         """Clean up expired sessions."""
         return await self.session_manager.cleanup_expired_sessions()
 
-    async def get_tool_stats(self) -> Dict[str, Any]:
-        """Get tool usage statistics."""
-        return self.tool_monitor.get_tool_stats()
-
     async def get_user_summary(self, user_id: int) -> Dict[str, Any]:
         """Get comprehensive user summary."""
         session_summary = await self.session_manager.get_user_session_summary(user_id)
-        tool_usage = self.tool_monitor.get_user_tool_usage(user_id)
 
         return {
             "user_id": user_id,
             **session_summary,
-            **tool_usage,
         }
 
     async def shutdown(self) -> None:
         """Shutdown integration and cleanup resources."""
         logger.info("Shutting down Claude integration")
 
-        # Kill any active processes
-        await self.manager.kill_all_processes()
-
-        # Clean up expired sessions
         await self.cleanup_expired_sessions()
 
         logger.info("Claude integration shutdown complete")
-
-    def _get_admin_instructions(self, blocked_tools: List[str]) -> str:
-        """Generate admin instructions for enabling blocked tools."""
-        instructions = []
-
-        # Check if settings file exists
-        settings_file = Path(".env")
-
-        if blocked_tools:
-            # Get current allowed tools and create merged list without duplicates
-            current_tools = [
-                "Read",
-                "Write",
-                "Edit",
-                "Bash",
-                "Glob",
-                "Grep",
-                "LS",
-                "Task",
-                "MultiEdit",
-                "NotebookRead",
-                "NotebookEdit",
-                "WebFetch",
-                "TodoRead",
-                "TodoWrite",
-                "WebSearch",
-            ]
-            merged_tools = list(
-                dict.fromkeys(current_tools + blocked_tools)
-            )  # Remove duplicates while preserving order
-            merged_tools_str = ",".join(merged_tools)
-            merged_tools_py = ", ".join(f'"{tool}"' for tool in merged_tools)
-
-            instructions.append("**For Administrators:**")
-            instructions.append("")
-
-            if settings_file.exists():
-                instructions.append(
-                    "To enable these tools, add them to your `.env` file:"
-                )
-                instructions.append("```")
-                instructions.append(f'CLAUDE_ALLOWED_TOOLS="{merged_tools_str}"')
-                instructions.append("```")
-            else:
-                instructions.append("To enable these tools:")
-                instructions.append("1. Create a `.env` file in your project root")
-                instructions.append("2. Add the following line:")
-                instructions.append("```")
-                instructions.append(f'CLAUDE_ALLOWED_TOOLS="{merged_tools_str}"')
-                instructions.append("```")
-
-            instructions.append("")
-            instructions.append("Or modify the default in `src/config/settings.py`:")
-            instructions.append("```python")
-            instructions.append("claude_allowed_tools: Optional[List[str]] = Field(")
-            instructions.append(f"    default=[{merged_tools_py}],")
-            instructions.append('    description="List of allowed Claude tools",')
-            instructions.append(")")
-            instructions.append("```")
-
-        return "\n".join(instructions)
-
-    def _create_tool_error_message(
-        self,
-        blocked_tools: List[str],
-        allowed_tools: List[str],
-        admin_instructions: str,
-    ) -> str:
-        """Create a comprehensive error message for tool validation failures."""
-        tool_list = ", ".join(f"`{tool}`" for tool in blocked_tools)
-        allowed_list = (
-            ", ".join(f"`{tool}`" for tool in allowed_tools)
-            if allowed_tools
-            else "None"
-        )
-
-        message = [
-            "🚫 **Tool Access Blocked**",
-            "",
-            f"Claude tried to use tools that are not currently allowed:",
-            f"{tool_list}",
-            "",
-            "**Why this happened:**",
-            "• Claude needs these tools to complete your request",
-            "• These tools are not in the allowed tools list",
-            "• This is a security feature to control what Claude can do",
-            "",
-            "**What you can do:**",
-            "• Contact the administrator to request access to these tools",
-            "• Try rephrasing your request to use different approaches",
-            "• Use simpler requests that don't require these tools",
-            "",
-            "**Currently allowed tools:**",
-            f"{allowed_list}",
-            "",
-            admin_instructions,
-        ]
-
-        return "\n".join(message)

@@ -91,7 +91,7 @@ def estimate_message_cost(event: Any) -> float:
     - Expected Claude usage
     """
     message = event.effective_message
-    message_text = message.text if message else ""
+    message_text = (message.text or "") if message else ""
 
     # Base cost for any message
     base_cost = 0.01
@@ -224,21 +224,24 @@ async def burst_protection_middleware(
         if user_burst_data["warnings_sent"] == 1:
             if event.effective_message:
                 await event.effective_message.reply_text(
-                    "⚠️ **Slow down!**\n\n"
+                    "⚠️ <b>Slow down!</b>\n\n"
                     "You're sending requests too quickly. "
-                    "Please wait a moment between messages."
+                    "Please wait a moment between messages.",
+                    parse_mode="HTML",
                 )
         elif user_burst_data["warnings_sent"] <= 3:
             if event.effective_message:
                 await event.effective_message.reply_text(
-                    "🛑 **Rate limit warning**\n\n"
-                    "Please reduce your request frequency to avoid being temporarily blocked."
+                    "🛑 <b>Rate limit warning</b>\n\n"
+                    "Please reduce your request frequency to avoid being temporarily blocked.",
+                    parse_mode="HTML",
                 )
         else:
             if event.effective_message:
                 await event.effective_message.reply_text(
-                    "🚫 **Temporarily blocked**\n\n"
-                    "Too many rapid requests. Please wait 30 seconds before trying again."
+                    "🚫 <b>Temporarily blocked</b>\n\n"
+                    "Too many rapid requests. Please wait 30 seconds before trying again.",
+                    parse_mode="HTML",
                 )
             return  # Block this request
 

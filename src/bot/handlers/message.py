@@ -4,14 +4,27 @@ import asyncio
 from typing import Optional
 
 import structlog
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.ext import ContextTypes
 
-from ...claude.exceptions import ClaudeToolValidationError
+from ...claude.exceptions import (
+    ClaudeError,
+    ClaudeMCPError,
+    ClaudeParsingError,
+    ClaudeProcessError,
+    ClaudeSessionError,
+    ClaudeTimeoutError,
+)
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.rate_limiter import RateLimiter
 from ...security.validators import SecurityValidator
+from ..utils.html_format import escape_html
+from ..utils.image_extractor import (
+    ImageAttachment,
+    should_send_as_photo,
+    validate_image_path,
+)
 
 logger = structlog.get_logger()
 
@@ -26,24 +39,24 @@ async def _format_progress_update(update_obj) -> Optional[str]:
             tool_name = update_obj.metadata.get("tool_name", "Tool")
 
         if update_obj.is_error():
-            return f"❌ **{tool_name} failed**\n\n_{update_obj.get_error_message()}_"
+            return f"❌ <b>{tool_name} failed</b>\n\n<i>{update_obj.get_error_message()}</i>"
         else:
             execution_time = ""
             if update_obj.metadata and update_obj.metadata.get("execution_time_ms"):
                 time_ms = update_obj.metadata["execution_time_ms"]
                 execution_time = f" ({time_ms}ms)"
-            return f"✅ **{tool_name} completed**{execution_time}"
+            return f"✅ <b>{tool_name} completed</b>{execution_time}"
 
     elif update_obj.type == "progress":
         # Handle progress updates
-        progress_text = f"🔄 **{update_obj.content or 'Working...'}**"
+        progress_text = f"🔄 <b>{update_obj.content or 'Working...'}</b>"
 
         percentage = update_obj.get_progress_percentage()
         if percentage is not None:
             # Create a simple progress bar
             filled = int(percentage / 10)  # 0-10 scale
             bar = "█" * filled + "░" * (10 - filled)
-            progress_text += f"\n\n`{bar}` {percentage}%"
+            progress_text += f"\n\n<code>{bar}</code> {percentage}%"
 
         if update_obj.progress:
             step = update_obj.progress.get("step")
@@ -55,14 +68,14 @@ async def _format_progress_update(update_obj) -> Optional[str]:
 
     elif update_obj.type == "error":
         # Handle error messages
-        return f"❌ **Error**\n\n_{update_obj.get_error_message()}_"
+        return f"❌ <b>Error</b>\n\n<i>{update_obj.get_error_message()}</i>"
 
     elif update_obj.type == "assistant" and update_obj.tool_calls:
         # Show when tools are being called
         tool_names = update_obj.get_tool_names()
         if tool_names:
             tools_text = ", ".join(tool_names)
-            return f"🔧 **Using tools:** {tools_text}"
+            return f"🔧 <b>Using tools:</b> {tools_text}"
 
     elif update_obj.type == "assistant" and update_obj.content:
         # Regular content updates with preview
@@ -71,60 +84,213 @@ async def _format_progress_update(update_obj) -> Optional[str]:
             if len(update_obj.content) > 150
             else update_obj.content
         )
-        return f"🤖 **Claude is working...**\n\n_{content_preview}_"
+        return f"🤖 <b>Claude is working...</b>\n\n<i>{content_preview}</i>"
 
     elif update_obj.type == "system":
         # System initialization or other system messages
         if update_obj.metadata and update_obj.metadata.get("subtype") == "init":
             tools_count = len(update_obj.metadata.get("tools", []))
             model = update_obj.metadata.get("model", "Claude")
-            return f"🚀 **Starting {model}** with {tools_count} tools available"
+            return f"🚀 <b>Starting {model}</b> with {tools_count} tools available"
 
     return None
 
 
-def _format_error_message(error_str: str) -> str:
-    """Format error messages for user-friendly display."""
-    if "usage limit reached" in error_str.lower():
-        # Usage limit error - already user-friendly from integration.py
-        return error_str
-    elif "tool not allowed" in error_str.lower():
-        # Tool validation error - already handled in facade.py
-        return error_str
-    elif "no conversation found" in error_str.lower():
-        return (
-            f"🔄 **Session Not Found**\n\n"
-            f"The Claude session could not be found or has expired.\n\n"
-            f"**What you can do:**\n"
-            f"• Use `/new` to start a fresh session\n"
-            f"• Try your request again\n"
-            f"• Use `/status` to check your current session"
-        )
-    elif "rate limit" in error_str.lower():
-        return (
-            f"⏱️ **Rate Limit Reached**\n\n"
-            f"Too many requests in a short time period.\n\n"
-            f"**What you can do:**\n"
-            f"• Wait a moment before trying again\n"
-            f"• Use simpler requests\n"
-            f"• Check your current usage with `/status`"
-        )
-    elif "timeout" in error_str.lower():
-        return (
-            f"⏰ **Request Timeout**\n\n"
-            f"Your request took too long to process and timed out.\n\n"
-            f"**What you can do:**\n"
-            f"• Try breaking down your request into smaller parts\n"
-            f"• Use simpler commands\n"
-            f"• Try again in a moment"
-        )
+def _format_error_message(error: Exception | str) -> str:
+    """Format error messages for user-friendly display.
+
+    Accepts an exception object (preferred) or a string for backward
+    compatibility.  When an exception is provided, the error type is used
+    to produce a specific, actionable message.
+    """
+    # Normalise: keep both the object and a string representation.
+    if isinstance(error, str):
+        error_str = error
+        error_obj: Exception | None = None
     else:
-        # Generic error handling
+        error_str = str(error)
+        error_obj = error
+
+    # --- Dispatch on exception type first (most specific) ---
+
+    if isinstance(error_obj, ClaudeTimeoutError):
         return (
-            f"❌ **Claude Code Error**\n\n"
-            f"Failed to process your request: {error_str}\n\n"
-            f"Please try again or contact the administrator if the problem persists."
+            "⏰ <b>Request Timeout</b>\n\n"
+            f"{escape_html(error_str)}\n\n"
+            "<b>What you can do:</b>\n"
+            "• Try breaking your request into smaller parts\n"
+            "• Avoid asking for very large file operations in one go\n"
+            "• Try again — transient slowdowns happen"
         )
+
+    if isinstance(error_obj, ClaudeMCPError):
+        server_hint = ""
+        if error_obj.server_name:
+            server_hint = f" (<code>{escape_html(error_obj.server_name)}</code>)"
+        return (
+            f"🔌 <b>MCP Server Error</b>{server_hint}\n\n"
+            f"{escape_html(error_str)}\n\n"
+            "<b>What you can do:</b>\n"
+            "• Check that the MCP server is running and reachable\n"
+            "• Verify <code>MCP_CONFIG_PATH</code> points to a valid config\n"
+            "• Ask the administrator to check MCP server logs"
+        )
+
+    if isinstance(error_obj, ClaudeParsingError):
+        return (
+            "📄 <b>Response Parsing Error</b>\n\n"
+            f"Claude returned a response that could not be parsed:\n"
+            f"<code>{escape_html(error_str[:300])}</code>\n\n"
+            "<b>What you can do:</b>\n"
+            "• Try your request again\n"
+            "• Rephrase your prompt if the problem persists"
+        )
+
+    if isinstance(error_obj, ClaudeSessionError):
+        return (
+            "🔄 <b>Session Error</b>\n\n"
+            f"{escape_html(error_str)}\n\n"
+            "<b>What you can do:</b>\n"
+            "• Use /new to start a fresh session\n"
+            "• Try your request again\n"
+            "• Use /status to check your current session"
+        )
+
+    if isinstance(error_obj, ClaudeProcessError):
+        return _format_process_error(error_str)
+
+    # Any future ClaudeError subtypes not explicitly handled above —
+    # preserve their existing message as-is rather than downgrading
+    # to a generic "process error".
+    if isinstance(error_obj, ClaudeError):
+        safe_error = escape_html(error_str)
+        if len(safe_error) > 500:
+            safe_error = safe_error[:500] + "..."
+        return (
+            f"❌ <b>Claude Error</b>\n\n"
+            f"{safe_error}\n\n"
+            f"Try again or use /new to start a fresh session."
+        )
+
+    # --- Fall back to keyword matching (for string-only callers) --------
+    # These patterns match the known error prefixes produced by
+    # sdk_integration.py and facade.py, NOT arbitrary user content.
+
+    error_lower = error_str.lower()
+
+    if "usage limit reached" in error_lower or "usage limit" in error_lower:
+        return error_str  # Already user-friendly
+
+    if "tool not allowed" in error_lower:
+        return error_str  # Already formatted by facade.py
+
+    if "no conversation found" in error_lower:
+        return (
+            "🔄 <b>Session Not Found</b>\n\n"
+            "The previous Claude session could not be found or has expired.\n\n"
+            "<b>What you can do:</b>\n"
+            "• Use /new to start a fresh session\n"
+            "• Try your request again\n"
+            "• Use /status to check your current session"
+        )
+
+    if "rate limit" in error_lower:
+        return (
+            "⏱️ <b>Rate Limit Reached</b>\n\n"
+            "Too many requests in a short time period.\n\n"
+            "<b>What you can do:</b>\n"
+            "• Wait a moment before trying again\n"
+            "• Use simpler requests\n"
+            "• Check your current usage with /status"
+        )
+
+    if "timed out after" in error_lower or "claude sdk timed out" in error_lower:
+        return (
+            "⏰ <b>Request Timeout</b>\n\n"
+            f"{escape_html(error_str)}\n\n"
+            "<b>What you can do:</b>\n"
+            "• Try breaking your request into smaller parts\n"
+            "• Avoid asking for very large file operations in one go\n"
+            "• Try again — transient slowdowns happen"
+        )
+
+    if "overloaded" in error_lower:
+        return (
+            "🏗️ <b>Claude is Overloaded</b>\n\n"
+            "The Claude API is currently experiencing high demand.\n\n"
+            "<b>What you can do:</b>\n"
+            "• Wait a moment and try again\n"
+            "• Shorter prompts may succeed more easily"
+        )
+
+    if "invalid api key" in error_lower or "authentication_error" in error_lower:
+        return (
+            "🔑 <b>API Authentication Error</b>\n\n"
+            "The API key used to connect to Claude is invalid or expired.\n\n"
+            "<b>What you can do:</b>\n"
+            "• Ask the administrator to verify the "
+            "<code>ANTHROPIC_API_KEY</code> setting\n"
+            "• Check that the API key has not been revoked"
+        )
+
+    # Match known SDK prefixes: "Failed to connect to Claude: ..."
+    # and "MCP server connection failed: ..."
+    if error_lower.startswith("failed to connect to claude"):
+        return (
+            "🌐 <b>Connection Error</b>\n\n"
+            f"Could not connect to Claude:\n"
+            f"<code>{escape_html(error_str[:300])}</code>\n\n"
+            "<b>What you can do:</b>\n"
+            "• Check your network / firewall settings\n"
+            "• Verify the Claude CLI is installed and accessible\n"
+            "• Try again in a moment"
+        )
+
+    # Match known SDK prefix: "Claude Code not found. ..."
+    if error_lower.startswith("claude code not found"):
+        return (
+            "🔍 <b>Claude CLI Not Found</b>\n\n"
+            f"{escape_html(error_str)}\n\n"
+            "<b>What you can do:</b>\n"
+            "• Ensure Claude Code is installed: "
+            "<code>npm install -g @anthropic-ai/claude-code</code>\n"
+            "• Set the <code>CLAUDE_CLI_PATH</code> environment variable"
+        )
+
+    # Match known SDK prefixes: "MCP server error: ..." and
+    # "MCP server connection failed: ..."
+    if error_lower.startswith("mcp server"):
+        return (
+            "🔌 <b>MCP Server Error</b>\n\n"
+            f"{escape_html(error_str)}\n\n"
+            "<b>What you can do:</b>\n"
+            "• Check that the MCP server is running\n"
+            "• Verify MCP configuration\n"
+            "• Ask the administrator to check MCP server logs"
+        )
+
+    # --- No match — show the raw error as-is ---
+    safe_error = escape_html(error_str)
+    if len(safe_error) > 500:
+        safe_error = safe_error[:500] + "..."
+
+    return f"❌ {safe_error}"
+
+
+def _format_process_error(error_str: str) -> str:
+    """Format a Claude process/SDK error with the actual details."""
+    safe_error = escape_html(error_str)
+    if len(safe_error) > 500:
+        safe_error = safe_error[:500] + "..."
+
+    return (
+        f"❌ <b>Claude Process Error</b>\n\n"
+        f"{safe_error}\n\n"
+        "<b>What you can do:</b>\n"
+        "• Try your request again\n"
+        "• Use /new to start a fresh session if the problem persists\n"
+        "• Check /status for current session state"
+    )
 
 
 async def handle_text_message(
@@ -170,10 +336,10 @@ async def handle_text_message(
 
         if not claude_integration:
             await update.message.reply_text(
-                "❌ **Claude integration not available**\n\n"
+                "❌ <b>Claude integration not available</b>\n\n"
                 "The Claude Code integration is not properly configured. "
                 "Please contact the administrator.",
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
             return
 
@@ -185,12 +351,36 @@ async def handle_text_message(
         # Get existing session ID
         session_id = context.user_data.get("claude_session_id")
 
+        # Check if /new was used — skip auto-resume for this first message.
+        # Flag is only cleared after a successful run so retries keep the intent.
+        force_new = bool(context.user_data.get("force_new_session"))
+
+        # MCP image collection via stream intercept
+        mcp_images: list[ImageAttachment] = []
+
         # Enhanced stream updates handler with progress tracking
         async def stream_handler(update_obj):
+            # Intercept send_image_to_user MCP tool calls.
+            # The SDK namespaces MCP tools as "mcp__<server>__<tool>".
+            if update_obj.tool_calls:
+                for tc in update_obj.tool_calls:
+                    tc_name = tc.get("name", "")
+                    if tc_name == "send_image_to_user" or tc_name.endswith(
+                        "__send_image_to_user"
+                    ):
+                        tc_input = tc.get("input", {})
+                        file_path = tc_input.get("file_path", "")
+                        caption = tc_input.get("caption", "")
+                        img = validate_image_path(
+                            file_path, settings.approved_directory, caption
+                        )
+                        if img:
+                            mcp_images.append(img)
+
             try:
                 progress_text = await _format_progress_update(update_obj)
                 if progress_text:
-                    await progress_msg.edit_text(progress_text, parse_mode="Markdown")
+                    await progress_msg.edit_text(progress_text, parse_mode="HTML")
             except Exception as e:
                 logger.warning("Failed to update progress message", error=str(e))
 
@@ -202,7 +392,12 @@ async def handle_text_message(
                 user_id=user_id,
                 session_id=session_id,
                 on_stream=stream_handler,
+                force_new=force_new,
             )
+
+            # New session created successfully — clear the one-shot flag
+            if force_new:
+                context.user_data["force_new_session"] = False
 
             # Update session ID
             context.user_data["claude_session_id"] = claude_response.session_id
@@ -233,53 +428,155 @@ async def handle_text_message(
                 claude_response.content
             )
 
-        except ClaudeToolValidationError as e:
-            # Tool validation error with detailed instructions
-            logger.error(
-                "Tool validation error",
-                error=str(e),
-                user_id=user_id,
-                blocked_tools=e.blocked_tools,
-            )
-            # Error message already formatted, create FormattedMessage
-            from ..utils.formatting import FormattedMessage
-
-            formatted_messages = [FormattedMessage(str(e), parse_mode="Markdown")]
         except Exception as e:
             logger.error("Claude integration failed", error=str(e), user_id=user_id)
-            # Format error and create FormattedMessage
             from ..utils.formatting import FormattedMessage
 
             formatted_messages = [
-                FormattedMessage(_format_error_message(str(e)), parse_mode="Markdown")
+                FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
 
         # Delete progress message
         await progress_msg.delete()
 
-        # Send formatted responses (may be multiple messages)
-        for i, message in enumerate(formatted_messages):
-            try:
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=message.reply_markup,
-                    reply_to_message_id=update.message.message_id if i == 0 else None,
-                )
+        # Use MCP-collected images (from send_image_to_user tool calls)
+        images: list[ImageAttachment] = mcp_images
 
-                # Small delay between messages to avoid rate limits
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
+        # Try to combine text + images when response fits in a caption
+        caption_sent = False
+        if images and len(formatted_messages) == 1:
+            msg = formatted_messages[0]
+            if msg.text and len(msg.text) <= 1024:
+                photos = [i for i in images if should_send_as_photo(i.path)]
+                documents = [i for i in images if not should_send_as_photo(i.path)]
+                if photos and not documents:
+                    try:
+                        if len(photos) == 1:
+                            with open(photos[0].path, "rb") as f:
+                                await update.message.reply_photo(
+                                    photo=f,
+                                    caption=msg.text,
+                                    parse_mode=msg.parse_mode,
+                                    reply_to_message_id=update.message.message_id,
+                                )
+                            caption_sent = True
+                        else:
+                            media = []
+                            file_handles = []
+                            for idx, img in enumerate(photos[:10]):
+                                fh = open(img.path, "rb")  # noqa: SIM115
+                                file_handles.append(fh)
+                                media.append(
+                                    InputMediaPhoto(
+                                        media=fh,
+                                        caption=msg.text if idx == 0 else None,
+                                        parse_mode=(
+                                            msg.parse_mode if idx == 0 else None
+                                        ),
+                                    )
+                                )
+                            try:
+                                await update.message.chat.send_media_group(
+                                    media=media,
+                                    reply_to_message_id=update.message.message_id,
+                                )
+                                caption_sent = True
+                            finally:
+                                for fh in file_handles:
+                                    fh.close()
+                    except Exception as album_err:
+                        logger.warning(
+                            "Failed to send photo+caption", error=str(album_err)
+                        )
 
-            except Exception as e:
-                logger.error(
-                    "Failed to send response message", error=str(e), message_index=i
-                )
-                # Try to send error message
-                await update.message.reply_text(
-                    "❌ Failed to send response. Please try again.",
-                    reply_to_message_id=update.message.message_id if i == 0 else None,
-                )
+        if not caption_sent:
+            # Send formatted responses (may be multiple messages)
+            for i, message in enumerate(formatted_messages):
+                try:
+                    await update.message.reply_text(
+                        message.text,
+                        parse_mode=message.parse_mode,
+                        reply_markup=message.reply_markup,
+                        reply_to_message_id=(
+                            update.message.message_id if i == 0 else None
+                        ),
+                    )
+                    if i < len(formatted_messages) - 1:
+                        await asyncio.sleep(0.5)
+                except Exception as send_err:
+                    logger.warning(
+                        "Failed to send HTML response, retrying as plain text",
+                        error=str(send_err),
+                        message_index=i,
+                    )
+                    try:
+                        await update.message.reply_text(
+                            message.text,
+                            reply_markup=message.reply_markup,
+                            reply_to_message_id=(
+                                update.message.message_id if i == 0 else None
+                            ),
+                        )
+                    except Exception as plain_err:
+                        logger.error(
+                            "Failed to send plain text fallback response",
+                            error=str(plain_err),
+                        )
+                        await update.message.reply_text(
+                            f"Failed to deliver response "
+                            f"(Telegram error: {str(plain_err)[:150]}). "
+                            f"Please try again.",
+                            reply_to_message_id=(
+                                update.message.message_id if i == 0 else None
+                            ),
+                        )
+
+            # Send images separately
+            if images:
+                photos = [i for i in images if should_send_as_photo(i.path)]
+                documents = [i for i in images if not should_send_as_photo(i.path)]
+                if photos:
+                    try:
+                        if len(photos) == 1:
+                            with open(photos[0].path, "rb") as f:
+                                await update.message.reply_photo(
+                                    photo=f,
+                                    reply_to_message_id=update.message.message_id,
+                                )
+                        else:
+                            media = []
+                            file_handles = []
+                            for img in photos[:10]:
+                                fh = open(img.path, "rb")  # noqa: SIM115
+                                file_handles.append(fh)
+                                media.append(InputMediaPhoto(media=fh))
+                            try:
+                                await update.message.chat.send_media_group(
+                                    media=media,
+                                    reply_to_message_id=update.message.message_id,
+                                )
+                            finally:
+                                for fh in file_handles:
+                                    fh.close()
+                    except Exception as album_err:
+                        logger.warning(
+                            "Failed to send photo album", error=str(album_err)
+                        )
+                for img in documents:
+                    try:
+                        with open(img.path, "rb") as f:
+                            await update.message.reply_document(
+                                document=f,
+                                filename=img.path.name,
+                                reply_to_message_id=update.message.message_id,
+                            )
+                        await asyncio.sleep(0.5)
+                    except Exception as doc_err:
+                        logger.warning(
+                            "Failed to send document image",
+                            path=str(img.path),
+                            error=str(doc_err),
+                        )
 
         # Update session info
         context.user_data["last_message"] = update.message.text
@@ -293,22 +590,16 @@ async def handle_text_message(
         if conversation_enhancer and claude_response:
             try:
                 # Update conversation context
-                conversation_context = conversation_enhancer.update_context(
-                    session_id=claude_response.session_id,
-                    user_id=user_id,
-                    working_directory=str(current_dir),
-                    tools_used=claude_response.tools_used or [],
-                    response_content=claude_response.content,
+                conversation_enhancer.update_context(user_id, claude_response)
+                conversation_context = conversation_enhancer.get_or_create_context(
+                    user_id
                 )
 
                 # Check if we should show follow-up suggestions
-                if conversation_enhancer.should_show_suggestions(
-                    claude_response.tools_used or [], claude_response.content
-                ):
+                if conversation_enhancer.should_show_suggestions(claude_response):
                     # Generate follow-up suggestions
                     suggestions = conversation_enhancer.generate_follow_up_suggestions(
-                        claude_response.content,
-                        claude_response.tools_used or [],
+                        claude_response,
                         conversation_context,
                     )
 
@@ -320,8 +611,8 @@ async def handle_text_message(
 
                         # Send follow-up suggestions
                         await update.message.reply_text(
-                            "💡 **What would you like to do next?**",
-                            parse_mode="Markdown",
+                            "💡 <b>What would you like to do next?</b>",
+                            parse_mode="HTML",
                             reply_markup=suggestion_keyboard,
                         )
 
@@ -345,11 +636,10 @@ async def handle_text_message(
         # Clean up progress message if it exists
         try:
             await progress_msg.delete()
-        except:
-            pass
+        except Exception as delete_error:
+            logger.debug("Failed to delete progress message", error=str(delete_error))
 
-        error_msg = f"❌ **Error processing message**\n\n{str(e)}"
-        await update.message.reply_text(error_msg, parse_mode="Markdown")
+        await update.message.reply_text(_format_error_message(e), parse_mode="HTML")
 
         # Log failed processing
         if audit_logger:
@@ -368,6 +658,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     document = update.message.document
     settings: Settings = context.bot_data["settings"]
+
+    # Initialize prompt to avoid UnboundLocalError
+    prompt: str = ""
 
     # Get services
     security_validator: Optional[SecurityValidator] = context.bot_data.get(
@@ -389,7 +682,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             valid, error = security_validator.validate_filename(document.file_name)
             if not valid:
                 await update.message.reply_text(
-                    f"❌ **File Upload Rejected**\n\n{error}"
+                    f"❌ <b>File Upload Rejected</b>\n\n{escape_html(error)}",
+                    parse_mode="HTML",
                 )
 
                 # Log security violation
@@ -406,9 +700,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         max_size = 10 * 1024 * 1024  # 10MB
         if document.file_size > max_size:
             await update.message.reply_text(
-                f"❌ **File Too Large**\n\n"
+                f"❌ <b>File Too Large</b>\n\n"
                 f"Maximum file size: {max_size // 1024 // 1024}MB\n"
-                f"Your file: {document.file_size / 1024 / 1024:.1f}MB"
+                f"Your file: {document.file_size / 1024 / 1024:.1f}MB",
+                parse_mode="HTML",
             )
             return
 
@@ -426,7 +721,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.chat.send_action("upload_document")
 
         progress_msg = await update.message.reply_text(
-            f"📄 Processing file: `{document.file_name}`...", parse_mode="Markdown"
+            f"📄 Processing file: <code>{document.file_name}</code>...",
+            parse_mode="HTML",
         )
 
         # Check if enhanced file handler is available
@@ -445,8 +741,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                 # Update progress message with file type info
                 await progress_msg.edit_text(
-                    f"📄 Processing {processed_file.type} file: `{document.file_name}`...",
-                    parse_mode="Markdown",
+                    f"📄 Processing {processed_file.type} file: <code>{document.file_name}</code>...",
+                    parse_mode="HTML",
                 )
 
             except Exception as e:
@@ -479,13 +775,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             except UnicodeDecodeError:
                 await progress_msg.edit_text(
-                    "❌ **File Format Not Supported**\n\n"
+                    "❌ <b>File Format Not Supported</b>\n\n"
                     "File must be text-based and UTF-8 encoded.\n\n"
-                    "**Supported formats:**\n"
+                    "<b>Supported formats:</b>\n"
                     "• Source code files (.py, .js, .ts, etc.)\n"
                     "• Text files (.txt, .md)\n"
                     "• Configuration files (.json, .yaml, .toml)\n"
-                    "• Documentation files"
+                    "• Documentation files",
+                    parse_mode="HTML",
                 )
                 return
 
@@ -494,7 +791,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Create a new progress message for Claude processing
         claude_progress_msg = await update.message.reply_text(
-            "🤖 Processing file with Claude...", parse_mode="Markdown"
+            "🤖 Processing file with Claude...", parse_mode="HTML"
         )
 
         # Get Claude integration from context
@@ -502,9 +799,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if not claude_integration:
             await claude_progress_msg.edit_text(
-                "❌ **Claude integration not available**\n\n"
+                "❌ <b>Claude integration not available</b>\n\n"
                 "The Claude Code integration is not properly configured.",
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
             return
 
@@ -556,7 +853,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         except Exception as e:
             await claude_progress_msg.edit_text(
-                _format_error_message(str(e)), parse_mode="Markdown"
+                _format_error_message(e), parse_mode="HTML"
             )
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
 
@@ -573,11 +870,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         try:
             await progress_msg.delete()
-        except:
-            pass
+        except Exception as delete_error:
+            logger.debug("Failed to delete progress message", error=str(delete_error))
 
-        error_msg = f"❌ **Error processing file**\n\n{str(e)}"
-        await update.message.reply_text(error_msg, parse_mode="Markdown")
+        error_msg = f"❌ <b>Error processing file</b>\n\n{escape_html(str(e))}"
+        await update.message.reply_text(error_msg, parse_mode="HTML")
 
         # Log failed file processing
         if audit_logger:
@@ -605,7 +902,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             # Send processing indicator
             progress_msg = await update.message.reply_text(
-                "📸 Processing image...", parse_mode="Markdown"
+                "📸 Processing image...", parse_mode="HTML"
             )
 
             # Get the largest photo size
@@ -621,7 +918,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             # Create Claude progress message
             claude_progress_msg = await update.message.reply_text(
-                "🤖 Analyzing image with Claude...", parse_mode="Markdown"
+                "🤖 Analyzing image with Claude...", parse_mode="HTML"
             )
 
             # Get Claude integration
@@ -629,9 +926,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             if not claude_integration:
                 await claude_progress_msg.edit_text(
-                    "❌ **Claude integration not available**\n\n"
+                    "❌ <b>Claude integration not available</b>\n\n"
                     "The Claude Code integration is not properly configured.",
-                    parse_mode="Markdown",
+                    parse_mode="HTML",
                 )
                 return
 
@@ -680,7 +977,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             except Exception as e:
                 await claude_progress_msg.edit_text(
-                    _format_error_message(str(e)), parse_mode="Markdown"
+                    _format_error_message(e), parse_mode="HTML"
                 )
                 logger.error(
                     "Claude image processing failed", error=str(e), user_id=user_id
@@ -689,21 +986,131 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception as e:
             logger.error("Image processing failed", error=str(e), user_id=user_id)
             await update.message.reply_text(
-                f"❌ **Error processing image**\n\n{str(e)}", parse_mode="Markdown"
+                _format_error_message(e),
+                parse_mode="HTML",
             )
     else:
         # Fall back to unsupported message
         await update.message.reply_text(
-            "📸 **Photo Upload**\n\n"
+            "📸 <b>Photo Upload</b>\n\n"
             "Photo processing is not yet supported.\n\n"
-            "**Currently supported:**\n"
+            "<b>Currently supported:</b>\n"
             "• Text files (.py, .js, .md, etc.)\n"
             "• Configuration files\n"
             "• Documentation files\n\n"
-            "**Coming soon:**\n"
+            "<b>Coming soon:</b>\n"
             "• Image analysis\n"
             "• Screenshot processing\n"
-            "• Diagram interpretation"
+            "• Diagram interpretation",
+            parse_mode="HTML",
+        )
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle voice message uploads."""
+    user_id = update.effective_user.id
+    settings: Settings = context.bot_data["settings"]
+
+    features = context.bot_data.get("features")
+    voice_handler = features.get_voice_handler() if features else None
+
+    if not voice_handler:
+        if settings.voice_provider == "local":
+            await update.message.reply_text(
+                "🎙️ <b>Voice Messages</b>\n\n"
+                "Voice transcription is not available.\n"
+                "Provider: <code>Local whisper.cpp</code>\n"
+                "Ensure whisper.cpp is installed and model file exists.\n"
+                "Set <code>WHISPER_CPP_BINARY_PATH</code> and "
+                "<code>WHISPER_CPP_MODEL_PATH</code> if needed.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "🎙️ <b>Voice Messages</b>\n\n"
+                "Voice transcription is not available.\n"
+                f"Provider: <code>{settings.voice_provider_display_name}</code>\n"
+                f"Set <code>{settings.voice_provider_api_key_env}</code> to enable.\n"
+                "Install optional voice deps with "
+                '<code>pip install "claude-code-telegram[voice]"</code>.',
+                parse_mode="HTML",
+            )
+        return
+
+    try:
+        progress_msg = await update.message.reply_text(
+            "🎙️ Transcribing voice message...", parse_mode="HTML"
+        )
+
+        voice = update.message.voice
+        processed_voice = await voice_handler.process_voice_message(
+            voice, update.message.caption
+        )
+
+        await progress_msg.edit_text(
+            "🤖 Processing transcription with Claude...", parse_mode="HTML"
+        )
+
+        claude_integration = context.bot_data.get("claude_integration")
+        if not claude_integration:
+            await progress_msg.edit_text(
+                "❌ <b>Claude integration not available</b>\n\n"
+                "The Claude Code integration is not properly configured.",
+                parse_mode="HTML",
+            )
+            return
+
+        current_dir = context.user_data.get(
+            "current_directory", settings.approved_directory
+        )
+        session_id = context.user_data.get("claude_session_id")
+
+        try:
+            # Keep classic mode aligned with handle_photo: single progress message,
+            # no streaming callback or typing heartbeat.
+            claude_response = await claude_integration.run_command(
+                prompt=processed_voice.prompt,
+                working_directory=current_dir,
+                user_id=user_id,
+                session_id=session_id,
+            )
+
+            context.user_data["claude_session_id"] = claude_response.session_id
+
+            _update_working_directory_from_claude_response(
+                claude_response, context, settings, user_id
+            )
+
+            from ..utils.formatting import ResponseFormatter
+
+            formatter = ResponseFormatter(settings)
+            formatted_messages = formatter.format_claude_response(
+                claude_response.content
+            )
+
+            await progress_msg.delete()
+
+            for i, message in enumerate(formatted_messages):
+                await update.message.reply_text(
+                    message.text,
+                    parse_mode=message.parse_mode,
+                    reply_markup=message.reply_markup,
+                    reply_to_message_id=(update.message.message_id if i == 0 else None),
+                )
+                if i < len(formatted_messages) - 1:
+                    await asyncio.sleep(0.5)
+
+        except Exception as e:
+            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            logger.error(
+                "Claude voice processing failed", error=str(e), user_id=user_id
+            )
+
+    except Exception as e:
+        logger.error("Voice processing failed", error=str(e), user_id=user_id)
+        await update.message.reply_text(
+            _format_error_message(e),
+            parse_mode="HTML",
         )
 
 
@@ -767,58 +1174,58 @@ async def _generate_placeholder_response(
         word in message_lower for word in ["list", "show", "see", "directory", "files"]
     ):
         response_text = (
-            f"🤖 **Claude Code Response** _(Placeholder)_\n\n"
-            f"I understand you want to see files. Try using the `/ls` command to list files "
-            f"in your current directory (`{relative_path}/`).\n\n"
-            f"**Available commands:**\n"
-            f"• `/ls` - List files\n"
-            f"• `/cd <dir>` - Change directory\n"
-            f"• `/projects` - Show projects\n\n"
-            f"_Note: Full Claude Code integration will be available in the next phase._"
+            f"🤖 <b>Claude Code Response</b> <i>(Placeholder)</i>\n\n"
+            f"I understand you want to see files. Try using the /ls command to list files "
+            f"in your current directory (<code>{relative_path}/</code>).\n\n"
+            f"<b>Available commands:</b>\n"
+            f"• /ls - List files\n"
+            f"• /cd &lt;dir&gt; - Change directory\n"
+            f"• /projects - Show projects\n\n"
+            f"<i>Note: Full Claude Code integration will be available in the next phase.</i>"
         )
 
     elif any(word in message_lower for word in ["create", "generate", "make", "build"]):
         response_text = (
-            f"🤖 **Claude Code Response** _(Placeholder)_\n\n"
+            f"🤖 <b>Claude Code Response</b> <i>(Placeholder)</i>\n\n"
             f"I understand you want to create something! Once the Claude Code integration "
             f"is complete, I'll be able to:\n\n"
             f"• Generate code files\n"
             f"• Create project structures\n"
             f"• Write documentation\n"
             f"• Build complete applications\n\n"
-            f"**Current directory:** `{relative_path}/`\n\n"
-            f"_Full functionality coming soon!_"
+            f"<b>Current directory:</b> <code>{relative_path}/</code>\n\n"
+            f"<i>Full functionality coming soon!</i>"
         )
 
     elif any(word in message_lower for word in ["help", "how", "what", "explain"]):
         response_text = (
-            f"🤖 **Claude Code Response** _(Placeholder)_\n\n"
-            f"I'm here to help! Try using `/help` for available commands.\n\n"
-            f"**What I can do now:**\n"
-            f"• Navigate directories (`/cd`, `/ls`, `/pwd`)\n"
-            f"• Show projects (`/projects`)\n"
-            f"• Manage sessions (`/new`, `/status`)\n\n"
-            f"**Coming soon:**\n"
-            f"• Full Claude Code integration\n"
-            f"• Code generation and editing\n"
-            f"• File operations\n"
-            f"• Advanced programming assistance"
+            "🤖 <b>Claude Code Response</b> <i>(Placeholder)</i>\n\n"
+            "I'm here to help! Try using /help for available commands.\n\n"
+            "<b>What I can do now:</b>\n"
+            "• Navigate directories (/cd, /ls, /pwd)\n"
+            "• Show projects (/projects)\n"
+            "• Manage sessions (/new, /status)\n\n"
+            "<b>Coming soon:</b>\n"
+            "• Full Claude Code integration\n"
+            "• Code generation and editing\n"
+            "• File operations\n"
+            "• Advanced programming assistance"
         )
 
     else:
         response_text = (
-            f"🤖 **Claude Code Response** _(Placeholder)_\n\n"
+            f"🤖 <b>Claude Code Response</b> <i>(Placeholder)</i>\n\n"
             f"I received your message: \"{message_text[:100]}{'...' if len(message_text) > 100 else ''}\"\n\n"
-            f"**Current Status:**\n"
-            f"• Directory: `{relative_path}/`\n"
+            f"<b>Current Status:</b>\n"
+            f"• Directory: <code>{relative_path}/</code>\n"
             f"• Bot core: ✅ Active\n"
             f"• Claude integration: 🔄 Coming soon\n\n"
             f"Once Claude Code integration is complete, I'll be able to process your "
             f"requests fully and help with coding tasks!\n\n"
-            f"For now, try the available commands like `/ls`, `/cd`, and `/help`."
+            f"For now, try the available commands like /ls, /cd, and /help."
         )
 
-    return {"text": response_text, "parse_mode": "Markdown"}
+    return {"text": response_text, "parse_mode": "HTML"}
 
 
 def _update_working_directory_from_claude_response(

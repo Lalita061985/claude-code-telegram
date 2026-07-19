@@ -16,6 +16,7 @@ from .git_integration import GitIntegration
 from .image_handler import ImageHandler
 from .quick_actions import QuickActionManager
 from .session_export import SessionExporter
+from .voice_handler import VoiceHandler
 
 logger = structlog.get_logger(__name__)
 
@@ -54,20 +55,21 @@ class FeatureRegistry:
             except Exception as e:
                 logger.error("Failed to initialize git integration", error=str(e))
 
-        # Quick actions - conditionally enabled
-        if self.config.enable_quick_actions:
+        # Quick actions - skip in agentic mode
+        if self.config.enable_quick_actions and not self.config.agentic_mode:
             try:
                 self.features["quick_actions"] = QuickActionManager()
                 logger.info("Quick actions feature enabled")
             except Exception as e:
                 logger.error("Failed to initialize quick actions", error=str(e))
 
-        # Session export - always enabled
-        try:
-            self.features["session_export"] = SessionExporter(storage=self.storage)
-            logger.info("Session export feature enabled")
-        except Exception as e:
-            logger.error("Failed to initialize session export", error=str(e))
+        # Session export - classic mode only
+        if not self.config.agentic_mode:
+            try:
+                self.features["session_export"] = SessionExporter(storage=self.storage)
+                logger.info("Session export feature enabled")
+            except Exception as e:
+                logger.error("Failed to initialize session export", error=str(e))
 
         # Image handling - always enabled
         try:
@@ -76,12 +78,26 @@ class FeatureRegistry:
         except Exception as e:
             logger.error("Failed to initialize image handler", error=str(e))
 
-        # Conversation enhancements - always enabled
-        try:
-            self.features["conversation"] = ConversationEnhancer()
-            logger.info("Conversation enhancer feature enabled")
-        except Exception as e:
-            logger.error("Failed to initialize conversation enhancer", error=str(e))
+        # Voice transcription - requires provider-specific API key (or local)
+        voice_key_available = (
+            (self.config.voice_provider == "local")
+            or (self.config.voice_provider == "openai" and self.config.openai_api_key)
+            or (self.config.voice_provider == "mistral" and self.config.mistral_api_key)
+        )
+        if self.config.enable_voice_messages and voice_key_available:
+            try:
+                self.features["voice_handler"] = VoiceHandler(config=self.config)
+                logger.info("Voice handler feature enabled")
+            except Exception as e:
+                logger.error("Failed to initialize voice handler", error=str(e))
+
+        # Conversation enhancements - skip in agentic mode
+        if not self.config.agentic_mode:
+            try:
+                self.features["conversation"] = ConversationEnhancer()
+                logger.info("Conversation enhancer feature enabled")
+            except Exception as e:
+                logger.error("Failed to initialize conversation enhancer", error=str(e))
 
         logger.info(
             "Feature initialization complete",
@@ -115,6 +131,10 @@ class FeatureRegistry:
     def get_image_handler(self) -> Optional[ImageHandler]:
         """Get image handler feature"""
         return self.get_feature("image_handler")
+
+    def get_voice_handler(self) -> Optional[VoiceHandler]:
+        """Get voice handler feature"""
+        return self.get_feature("voice_handler")
 
     def get_conversation_enhancer(self) -> Optional[ConversationEnhancer]:
         """Get conversation enhancer feature"""
